@@ -16,8 +16,7 @@ matrix:
     - os: osx
       before_install:
         - brew upgrade python
-        - brew upgrade libxml2 --with-python
-        - ln -s /usr/local/Cellar/libxml2/2.9.4/lbi/python2.7/site-packages/* /Library/Python/2.7/site-packages
+        - brew uninstall --force libxml2 && brew install libxml2 --with-python && brew link --force libxml2
       cache:
         directories:
           - $HOME/Library/Caches/Homebrew
