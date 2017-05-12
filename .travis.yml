@@ -14,6 +14,6 @@ addons:
 matrix:
   include:
     - os: osx
-      before_install: brew install libxml2 --with-python
+      before_install: brew uninstall libxml2 && brew install libxml2 --with-python
 install: sudo python setup.py install --record files.txt
 script: ./run_all_tests.sh
