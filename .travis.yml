@@ -17,7 +17,7 @@ matrix:
       before_install:
         - brew upgrade python
         - brew reinstall libxml2 --with-python && brew link --force libxml2
-        - brew install libxslt
+        - brew install libxslt pango
         - pip install pyserial
       cache:
         directories:
