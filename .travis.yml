@@ -10,4 +10,4 @@ addons:
       - python-serial
       - python-suds
       - python-support
-install: python setup.py install --record files.txt
+script: python setup.py install --record files.txt
