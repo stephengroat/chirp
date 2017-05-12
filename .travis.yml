@@ -14,7 +14,7 @@ addons:
 matrix:
   include:
     - os: osx
-      before_install: brew uninstall libxml2 && brew upgrade && brew install libxml2 --with-python
+      before_install: brew uninstall libxml2 && brew install libxml2 --with-python && brew upgrade
       cache:
         directories:
           - $HOME/Library/Caches/Homebrew
