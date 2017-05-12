@@ -10,5 +10,9 @@ addons:
       - python-serial
       - python-suds
       - python-support
+matrix:
+  include:
+    - os: osx
+      install: python setup.py install --record files.txt
 install: sudo python setup.py install --record files.txt
 script: ./run_all_tests.sh
