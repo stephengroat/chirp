@@ -10,4 +10,6 @@ addons:
       - python-serial
       - python-suds
       - python-support
-script: python setup.py install --record files.txt
+virtual_env:
+  system_site_packages: true
+install: python setup.py install --record files.txt
