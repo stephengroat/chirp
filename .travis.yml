@@ -16,7 +16,7 @@ matrix:
     - os: osx
       before_install:
         - brew upgrade python
-        - brew uninstall --force libxml2 && brew install libxml2 --with-python && brew link --force libxml2
+        - brew reinstall libxml2 --with-python && brew link --force libxml2
       cache:
         directories:
           - $HOME/Library/Caches/Homebrew
