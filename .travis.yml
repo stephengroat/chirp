@@ -3,6 +3,8 @@ version: 2.7
 addons:
   apt:
     packages:
+      - libxml2
+      - libxml2-dev
       - python
       - python-gtk2
       - python-libxml2
@@ -12,4 +14,4 @@ addons:
       - python-support
 virtual_env:
   system_site_packages: true
-install: python setup.py install --record files.txt
+script: python setup.py install --record files.txt
