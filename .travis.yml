@@ -1,10 +1,7 @@
-language: python
-version: 2.7
+language: generic
 addons:
   apt:
     packages:
-      - libxml2
-      - libxml2-dev
       - python
       - python-gtk2
       - python-libxml2
@@ -12,6 +9,4 @@ addons:
       - python-serial
       - python-suds
       - python-support
-virtual_env:
-  system_site_packages: true
-script: python setup.py install --record files.txt
+install: python setup.py install --record files.txt
