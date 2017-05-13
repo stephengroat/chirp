@@ -84,7 +84,7 @@ def macos_build():
     APP = ['chirp-%s.py' % CHIRP_VERSION]
     shutil.copy("chirpw", APP[0])
     DATA_FILES = [('../Frameworks', ['/usr/local/opt/pango/lib/libpangoxft-1.0.dylib']),
-                  ('../Resources/', ['/usr/local/opt/pango']),
+                  #('../Resources/', ['/usr/local/opt/pango']),
                   ]
     OPTIONS = {'argv_emulation': True, "includes": "gtk,atk,pangocairo,cairo"}
 
@@ -94,11 +94,6 @@ def macos_build():
         options={'py2app': OPTIONS},
         setup_requires=['py2app'],
         )
-
-    EXEC = 'bash ./build/macos/make_pango.sh ' + \
-           '/opt/local dist/chirp-%s.app' % CHIRP_VERSION
-    # print "exec string: %s" % EXEC
-    os.system(EXEC)
 
 
 def default_build():
