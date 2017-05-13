@@ -83,8 +83,8 @@ def macos_build():
 
     APP = ['chirp-%s.py' % CHIRP_VERSION]
     shutil.copy("chirpw", APP[0])
-    DATA_FILES = [('../Frameworks', ['/opt/local/lib/libpangox-1.0.dylib']),
-                  ('../Resources/', ['/opt/local/lib/pango']),
+    DATA_FILES = [('../Frameworks', ['/usr/local/opt/pango/lib/libpangoxft-1.0.dylib']),
+                  ('../Resources/', ['/usr/local/opt/pango']),
                   ]
     OPTIONS = {'argv_emulation': True, "includes": "gtk,atk,pangocairo,cairo"}
 
