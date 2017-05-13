@@ -17,7 +17,7 @@ matrix:
       before_install:
         - brew upgrade python
         - brew reinstall libxml2 --with-python && brew link --force libxml2
-        - brew install libxslt
+        - brew install libxslt pygtk
         - brew install cairo pango --with-x11
         - pip install pyserial nose mox
       cache:
