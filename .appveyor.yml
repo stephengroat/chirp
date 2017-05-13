@@ -11,12 +11,9 @@ environment:
 # TODO sgroat download libxml2 and libxslt
 install:
   # We need wheel installed to build wheels
-  - "nuget.exe install libxml2"
-  - "dir"
-  - "dir libxml2.2.7.8.7\\build\\native\\lib\\v100\\x64\\release"
-  - "nuget.exe install libxslt"
-  - "dir"
-  - "%PYTHON%\\python.exe -m pip install wheel libxml2-python"
+  - ps: Start-FileDownload "http://cygwin.com/setup-x86_64.exe" -FileName "setup-x86_64.exe"
+  - setup-x86_64.exe -quiet-mode --no-shortcuts --only-site --root "C:\cygwin64" --site "http://cygwin.mirror.constant.com" --local-package-dir "C:\cygwin64\var\cache\setup" --packages "python-gtk2.0-devel" --upgrade-also
+  - C:\cygwin64\bin\bash -lc "cd $(cygpath ${APPVEYOR_BUILD_FOLDER}) && build/make_win32_build.sh"
 
 build: off
 
@@ -28,5 +25,4 @@ test_script:
   # Note that you must use the environment variable %PYTHON% to refer to
   # the interpreter you're using - Appveyor does not do anything special
   # to put the Python version you want to use on PATH.
-  - "%PYTHON%\\python.exe setup.py install --record files.txt"
   - run_all_tests.bat
