@@ -19,7 +19,7 @@ matrix:
         - brew reinstall libxml2 --with-python && brew link --force libxml2
         - brew install libxslt
         - brew install cairo pango --with-x11
-        - pip install pyserial
+        - pip install pyserial nose
       cache:
         directories:
           - $HOME/Library/Caches/Homebrew
