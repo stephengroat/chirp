@@ -13,7 +13,7 @@ install:
   # We need wheel installed to build wheels
   - "nuget.exe install libxml2"
   - "dir"
-  - "dir libxml2.2.7.8.7\\build\\native"
+  - "dir libxml2.2.7.8.7\\build\\native\lib"
   - "nuget.exe install libxslt"
   - "dir"
   - "%PYTHON%\\python.exe -m pip install wheel libxml2-python"
