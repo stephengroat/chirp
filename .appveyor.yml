@@ -12,7 +12,7 @@ environment:
 install:
   # We need wheel installed to build wheels
   - ps: Start-FileDownload "http://cygwin.com/setup-x86_64.exe" -FileName "setup-x86_64.exe"
-  - setup-x86_64.exe --quiet-mode --no-shortcuts --only-site --root "C:\cygwin64" --site "http://cygwin.mirror.constant.com" --local-package-dir "C:\cygwin64\var\cache\setup" --packages "python2-libxml2 python-gtk2.0-devel python-libxml2" --upgrade-also
+  - setup-x86_64.exe --quiet-mode --no-shortcuts --only-site --root "C:\cygwin64" --site "http://cygwin.mirror.constant.com" --local-package-dir "C:\cygwin64\var\cache\setup" --packages "python-gtk2.0-devel,python-libxml2" --upgrade-also
   - C:\cygwin64\bin\bash -lc "cd $(cygpath ${APPVEYOR_BUILD_FOLDER}) && build/make_win32_build.sh"
 
 build: off
