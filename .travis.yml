@@ -17,8 +17,7 @@ matrix:
       before_install:
         - brew upgrade python
         - brew reinstall libxml2 --with-python && brew link --force libxml2
-        - brew tap-pin stephengroat/homebrew-chirp
-        - brew install pango --with-x11
+        - brew install pango --with-x11 --tap=stephengroat/chirp
         - brew install libxslt pygtk
         - pip install pyserial nose mox
       cache:
