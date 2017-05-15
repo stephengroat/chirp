@@ -21,7 +21,7 @@ build_locale() {
 
 build_win32() {
     echo Building Win32 executable...
-    python setup.py py2exe
+    python2 setup.py py2exe
     if [ $? -ne 0 ]; then
         echo "Build failed"
         exit
