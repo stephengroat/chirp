@@ -8,7 +8,7 @@ install:
   - setup-x86.exe --quiet-mode --no-shortcuts --only-site --root "C:\cygwin" --site "http://cygwin.mirror.constant.com" --local-package-dir "C:\cygwin\var\cache\setup" --packages "python-gtk2.0-devel,python2-libxml2,python2-libxslt,python2-pip" --upgrade-also
   - C:\cygwin\bin\bash -lc "pip install pyserial nose mox pypiwin32"
 
-build_script: C:\cygwin\bin\bash -lc "cd $(cygpath ${APPVEYOR_BUILD_FOLDER}) && env && /cygdrive/c/Python27/python.exe setup.py py2exe && build/make_win32_build.sh"
+build_script: C:\cygwin\bin\bash -lc "cd $(cygpath ${APPVEYOR_BUILD_FOLDER}) && env && build/make_win32_build.sh"
 
 test_script:
   # Put your test command here.
