@@ -1,21 +1,8 @@
-    # For Python versions available on Appveyor, see
-    # http://www.appveyor.com/docs/installed-software#python
-    # The list here is complete (excluding Python 2.6, which
-    # isn't covered by this document) at the time of writing.
-
 install:
   - ps: Start-FileDownload "http://cygwin.com/setup-x86.exe" -FileName "setup-x86.exe"
-  - setup-x86.exe --quiet-mode --no-shortcuts --only-site --root "C:\cygwin" --site "http://cygwin.mirror.constant.com" --local-package-dir "C:\cygwin\var\cache\setup" --packages "python-gtk2.0-devel,python2-libxml2,python2-libxslt,python2-pip" --upgrade-also
+  - setup-x86.exe --quiet-mode --no-shortcuts --only-site --root "C:\cygwin" --site "http://cygwin.mirror.constant.com" --local-package-dir "C:\cygwin\var\cache\setup" --packages "python-gtk2.0-devel,python2-libxml2,python2-pip" --upgrade-also
   - C:\cygwin\bin\bash -lc "pip install pyserial nose mox pep8 pypiwin32"
 
-build_script: C:\cygwin\bin\bash -lc "cd $(cygpath ${APPVEYOR_BUILD_FOLDER}) && env && build/make_win32_build.sh"
+build_script: C:\cygwin\bin\bash -lc "cd $(cygpath ${APPVEYOR_BUILD_FOLDER}) && build/make_win32_build.sh"
 
-test_script:
-  # Put your test command here.
-  # If you don't need to build C extensions on 64-bit Python 3.3 or 3.4,
-  # you can remove "build.cmd" from the front of the command, as it's
-  # only needed to support those cases.
-  # Note that you must use the environment variable %PYTHON% to refer to
-  # the interpreter you're using - Appveyor does not do anything special
-  # to put the Python version you want to use on PATH.
-  - run_all_tests.bat
+test_script: run_all_tests.bat
