@@ -1,18 +1,11 @@
-environment:
-
-  matrix:
-
     # For Python versions available on Appveyor, see
     # http://www.appveyor.com/docs/installed-software#python
     # The list here is complete (excluding Python 2.6, which
     # isn't covered by this document) at the time of writing.
 
-    - PYTHON: "C:\\Python27"
-# TODO sgroat download libxml2 and libxslt
 install:
-  # We need wheel installed to build wheels
   - ps: Start-FileDownload "http://cygwin.com/setup-x86.exe" -FileName "setup-x86.exe"
-  - setup-x86.exe --quiet-mode --no-shortcuts --only-site --root "C:\cygwin" --site "http://cygwin.mirror.constant.com" --local-package-dir "C:\cygwin64\var\cache\setup" --packages "python-gtk2.0-devel,python2-libxml2-devel,python2-pip" --upgrade-also
+  - setup-x86.exe --quiet-mode --no-shortcuts --only-site --root "C:\cygwin" --site "http://cygwin.mirror.constant.com" --local-package-dir "C:\cygwin\var\cache\setup" --packages "python-gtk2.0-devel,python2-libxml2,python2-libxslt,python2-pip" --upgrade-also
   - C:\cygwin64\bin\bash -lc "pip install pyserial nose mox pypiwin32"
   - C:\cygwin64\bin\bash -lc "cd $(cygpath ${APPVEYOR_BUILD_FOLDER}) && env && /cygdrive/c/Python27/python.exe setup.py py2exe && build/make_win32_build.sh"
 
