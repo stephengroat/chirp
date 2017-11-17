@@ -1,3 +1,7 @@
+init:
+# Allows RDP
+    - ps: iex ((new-object net.webclient).DownloadString('https://raw.githubusercontent.com/appveyor/ci/master/scripts/enable-rdp.ps1'))
+
 install:
   - ps: Start-FileDownload "http://cygwin.com/setup-x86.exe" -FileName "setup-x86.exe"
   - setup-x86.exe --quiet-mode --no-shortcuts --only-site --root "C:\cygwin" --site "http://cygwin.mirror.constant.com" --local-package-dir "C:\cygwin\var\cache\setup" --packages "python-gtk2.0-devel,python2-libxml2,python2-pip" --upgrade-also
