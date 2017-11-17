@@ -1,4 +1,6 @@
-# Copyright 2016 Tom Hayward <tom@tomh.us>
+#!/usr/bin/env python
+#
+# Copyright 2008 Dan Smith <dsmith@danplanet.com>
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -13,127 +15,344 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-import json
-import logging
-import tempfile
-import urllib
-from chirp import chirp_common, errors
-from chirp.settings import RadioSetting, RadioSettingGroup, \
-     RadioSettingValueList
+import gobject
+import gtk
+import threading
+import serial
+import os
 
-LOG = logging.getLogger(__name__)
+import csvdump
+from chirp.ui import inputdialog, cloneprog
+
+import chirp
+from chirp import ic9x, id800, ic2820, ic2200, errors
+from chirp import platform
+
+gobject.threads_init()
+
+RADIOS = {"ic9x:A": ic9x.IC9xRadioA,
+          "ic9x:B": ic9x.IC9xRadioB,
+          "id800":  id800.ID800v2Radio,
+          "ic2820": ic2820.IC2820Radio,
+          "ic2200": ic2200.IC2200Radio,
+          }
 
 
-def list_filter(haystack, attr, needles):
-    if not needles or not needles[0]:
-        return haystack
-    return [x for x in haystack if x[attr] in needles]
+class CsvDumpApp:
+    def update_status(self, s):
+        gobject.idle_add(self.progwin.status, s)
 
+    def _download_img(self):
+        gobject.idle_add(self.progwin.show)
+        fn = "%s.img" % self.rtype
 
-class DMRMARCRadio(chirp_common.NetworkSourceRadio):
-    """DMR-MARC data source"""
-    VENDOR = "DMR-MARC"
-    MODEL = "Repeater database"
+        try:
+            s = serial.Serial(port=self.rport,
+                              baudrate=RADIOS[self.rtype].BAUD_RATE,
+                              timeout=0.5)
 
-    URL = "http://www.dmr-marc.net/cgi-bin/trbo-database/datadump.cgi?" \
-          "table=repeaters&format=json"
+            radio = RADIOS[self.rtype](s)
+            radio.status_fn = self.update_status
+            radio.sync_in()
 
-    def __init__(self, *args, **kwargs):
-        chirp_common.NetworkSourceRadio.__init__(self, *args, **kwargs)
-        self._repeaters = None
+            print "Sync done, saving to: %s" % fn
+            radio.save_mmap(fn)
 
-    def set_params(self, city, state, country):
-        """Set the parameters to be used for a query"""
-        self._city = city and [x.strip() for x in city.split(",")] or ['']
-        self._state = state and [x.strip() for x in state.split(",")] or ['']
-        self._country = country and [x.strip() for x in country.split(",")] \
-            or ['']
+            self.refresh_radio()
+        except serial.SerialException, e:
+            gobject.idle_add(self.mainwin.set_status,
+                             "Error: Unable to open serial port")
+        except Exception, e:
+            gobject.idle_add(self.mainwin.set_status,
+                             "Error: %s" % e)
 
-    def do_fetch(self):
-        fn = tempfile.mktemp(".json")
-        filename, headers = urllib.urlretrieve(self.URL, fn)
-        with open(fn, 'r') as f:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+        gobject.idle_add(self.progwin.hide)
+
+    def download_img(self):
+        t = threading.Thread(target=self._download_img)
+        t.start()
+
+    def _upload_img(self):
+        gobject.idle_add(self.progwin.show)
+        fn = "%s.img" % self.rtype
+
+        try:
+            s = serial.Serial(port=self.rport,
+                              baudrate=RADIOS[self.rtype].BAUD_RATE,
+                              timeout=0.5)
+
+            radio = RADIOS[self.rtype](s)
+            radio.status_fn = self.update_status
+
+            print "Loading image from %s" % fn
+            radio.load_mmap(fn)
+
+            radio.sync_out()
+        except Exception, e:
+            gobject.idle_add(self.mainwin.set_status,
+                             "Error: %s" % e)
+
+        try:
+            s.close()
+        except Exception:
+            pass
+
+        gobject.idle_add(self.progwin.hide)
+
+    def upload_img(self):
+        t = threading.Thread(target=self._upload_img)
+        t.start()
+
+    def _export_file_mmap(self, fname):
+        count = 0
+
+        try:
+            f = file(fname, "w")
+        except Exception, e:
+            self.mainwin.set_status("%s: %s" % (fname, e))
+            return
+
+        print >>f, chirp.chirp_common.Memory.CSV_FORMAT
+        for m in self.radio.get_memories():
+            print >>f, m.to_csv()
+            count += 1
+        f.close()
+
+        self.mainwin.set_status("Exported %i memories" % count)
+
+    def _export_file_live(self, fname, l, h):
+        gobject.idle_add(self.progwin.show)
+
+        try:
+            f = file(fname, "w")
+        except Exception, e:
+            gobject.idle_add(self.progwin.hide)
+            gobject.idle_add(self.mainwin.set_status, "%s: %s" % (fname, e))
+            return
+
+        print >>f, chirp.chirp_common.Memory.CSV_FORMAT
+        for i in range(l, h+1):
+            s = chirp.chirp_common.Status()
+            s.msg = "Reading memory %i" % i
+            s.cur = i
+            s.max = h+1
+            gobject.idle_add(self.progwin.status, s)
+
             try:
-                self._repeaters = json.load(f)['repeaters']
-            except AttributeError:
-                raise errors.RadioError(
-                    "Unexpected response from %s" % self.URL)
-            except ValueError as e:
-                raise errors.RadioError(
-                    "Invalid JSON from %s. %s" % (self.URL, str(e)))
+                m = self.radio.get_memory(i)
+                print >>f, m.to_csv()
+            except chirp.errors.InvalidMemoryLocation:
+                pass
 
-        self._repeaters = list_filter(self._repeaters, "city", self._city)
-        self._repeaters = list_filter(self._repeaters, "state", self._state)
-        self._repeaters = list_filter(self._repeaters, "country",
-                                      self._country)
+        f.close()
 
-    def get_features(self):
-        if not self._repeaters:
-            self.do_fetch()
+        gobject.idle_add(self.progwin.hide)
 
-        rf = chirp_common.RadioFeatures()
-        rf.memory_bounds = (0, len(self._repeaters)-1)
-        rf.has_bank = False
-        rf.has_comment = True
-        rf.has_ctone = False
-        rf.valid_tmodes = [""]
-        return rf
+    def get_mem_range(self):
+        d = inputdialog.FieldDialog(title="Select Memory Range")
 
-    def get_raw_memory(self, number):
-        return repr(self._repeaters[number])
+        limit = RADIOS[self.rtype].mem_upper_limit
 
-    def get_memory(self, number):
-        if not self._repeaters:
-            self.do_fetch()
+        la = gtk.Adjustment(0, 0, limit, 1, 10, 10)
+        d.add_field("Start", gtk.SpinButton(la, 0))
 
-        repeater = self._repeaters[number]
+        ua = gtk.Adjustment(100, 0, limit, 1, 10, 10)
+        d.add_field("End", gtk.SpinButton(ua, 0))
 
-        mem = chirp_common.Memory()
-        mem.number = number
+        r = d.run()
+        low = int(la.get_value())
+        high = int(ua.get_value())
+        d.destroy()
 
-        mem.name = repeater.get('city')
-        mem.freq = chirp_common.parse_freq(repeater.get('frequency'))
-        offset = chirp_common.parse_freq(repeater.get('offset', '0'))
-        if offset > 0:
-            mem.duplex = "+"
-        elif offset < 0:
-            mem.duplex = "-"
+        if r == gtk.RESPONSE_OK:
+            return low, high
         else:
-            mem.duplex = ""
-        mem.offset = abs(offset)
-        mem.mode = 'DMR'
-        mem.comment = repeater.get('map_info')
+            return None, None
 
-        mem.extra = RadioSettingGroup("Extra", "extra")
+    def export_file(self, fname):
+        if not fname.lower().endswith(".csv"):
+            fname += ".csv"
 
-        rs = RadioSetting(
-            "color_code", "Color Code", RadioSettingValueList(
-                range(16), int(repeater.get('color_code', 0))))
-        mem.extra.append(rs)
+        if self.rtype.startswith("ic9x"):
+            l, h = self.get_mem_range()
+            if l is None or h is None:
+                return
 
-        return mem
+            t = threading.Thread(target=self._export_file_live,
+                                 args=(fname, l, h))
+            t.start()
+        else:
+            self._export_file_mmap(fname)
 
+    def _parse_mem_line(self, line):
+        try:
+            num, name, freq, _ = line.split(",")
+            m = chirp.chirp_common.Memory()
+            m.name = name
+            m.number = int(num)
+            m.freq = float(freq)
+        except Exception, e:
+            print "Failed to parse `%s': %s" % (line, e)
+            return None
 
-def main():
-    import argparse
-    from pprint import PrettyPrinter
+        return m
 
-    parser = argparse.ArgumentParser(description="Fetch DMR-MARC repeater "
-        "database and filter by city, state, and/or country. Multiple items "
-        "combined with a , will be filtered with logical OR.")
-    parser.add_argument("-c", "--city",
-        help="Comma-separated list of cities to include in output.")
-    parser.add_argument("-s", "--state",
-        help="Comma-separated list of states to include in output.")
-    parser.add_argument("--country",
-        help="Comma-separated list of countries to include in output.")
-    args = parser.parse_args()
+    def _import_file_live(self, fname):
+        gobject.idle_add(self.progwin.show)
 
-    dmrmarc = DMRMARCRadio(None)
-    dmrmarc.set_params(**vars(args))
-    dmrmarc.do_fetch()
-    pp = PrettyPrinter(indent=2)
-    pp.pprint(dmrmarc._repeaters)
+        try:
+            f = file(fname, "rU")
+        except Exception, e:
+            gobject.idle_add(self.progwin.hide)
+            gobject.idle_add(self.mainwin.set_status,
+                             "%s: %s" % (fname, e))
+            return
+
+        lines = f.readlines()
+        f.close()
+
+        memories = []
+        lineno = 0
+        for line in lines:
+            try:
+                m = chirp.chirp_common.Memory.from_csv(line)
+            except errors.InvalidMemoryLocation:
+                continue
+            except Exception, e:
+                print "Parse error on line %i: %s" % (lineno, e)
+                break  # FIXME: Report error here
+
+            lineno += 1
+            memories.append(m)
+
+        count = 0
+        for m in memories:
+            s = chirp.chirp_common.Status()
+            s.msg = "Sending memory %i" % m.number
+            s.cur = count
+            s.max = len(memories)
+            gobject.idle_add(self.progwin.status, s)
+
+#            try:
+#                self.radio.get_memory(m.number, 2)
+#            except errors.InvalidMemoryLocation:
+#                m
+
+            try:
+                self.radio.set_memory(m)
+            except Exception, e:
+                print "Error setting memory %i: %s" % (m.number, e)
+                break
+
+            count += 1
+
+        gobject.idle_add(self.progwin.hide)
+
+        gobject.idle_add(self.mainwin.set_status, "Wrote %i memories" % count)
+
+    def _import_file_mmap(self, fname):
+        try:
+            f = file(fname, "rU")
+        except Exception, e:
+            self.progwin.hide()
+            self.mainwin.set_status("%s: %s" % (fname, e))
+            return
+
+        lines = f.readlines()
+        f.close()
+        lineno = 0
+
+        for line in lines:
+            lineno += 1
+            try:
+                m = chirp.chirp_common.Memory.from_csv(line.strip())
+                print "Imported: %s" % m
+            except Exception, e:
+                if lineno == 1:
+                    continue
+                import traceback
+                traceback.print_exc()
+                self.mainwin.set_status("Error on line %i: %s" % (lineno, e))
+                return
+
+            print "Setting memory: %s" % m
+            self.radio.set_memory(m)
+
+        print "Saving image to %s.img" % self.rtype
+        self.radio.save_mmap("%s.img" % self.rtype)
+
+        self.mainwin.set_status("Imported %s" % os.path.basename(fname))
+
+    def import_file(self, fname):
+        if self.rtype.startswith("ic9x"):
+            t = threading.Thread(target=self._import_file_live,
+                                 args=(fname,))
+            t.start()
+        else:
+            self._import_file_mmap(fname)
+
+    def refresh_radio(self):
+        rtype = RADIOS[self.rtype]
+        smsg = "Ready"
+
+        if self.radio:
+            try:
+                self.radio.pipe.close()
+            except Exception, e:
+                pass
+
+        if not self.rtype.startswith("ic9x"):
+            mmap = "%s.img" % self.rtype
+            if os.path.isfile(mmap):
+                self.radio = rtype(mmap)
+                self.mainwin.set_image_info(True, True, "Image loaded")
+            else:
+                self.radio = None
+                self.mainwin.set_image_info(False, False, "No image")
+                smsg = "Radio image must be downloaded"
+        else:
+            try:
+                s = serial.Serial(port=self.rport,
+                                  baudrate=rtype.BAUD_RATE,
+                                  timeout=0.1)
+                self.radio = rtype(s)
+                self.mainwin.set_image_info(False, True, "Live")
+            except Exception, e:
+                smsg = "Error: Unable to open serial port"
+                self.mainwin.set_image_info(False, False, "")
+
+        self.mainwin.set_status(smsg)
+
+    def select_radio(self, radio, port):
+        self.rtype = radio
+        self.rport = port
+        self.refresh_radio()
+
+    def __init__(self):
+        self.mainwin = csvdump.CsvDumpWindow(self.select_radio,
+                                             self.download_img,
+                                             self.upload_img,
+                                             self.import_file,
+                                             self.export_file)
+
+        self.progwin = cloneprog.CloneProg()
+        self.progwin.set_transient_for(self.mainwin)
+        self.progwin.set_type_hint(gtk.gdk.WINDOW_TYPE_HINT_DIALOG)
+
+        self.radio = None
+
+    def run(self):
+        self.mainwin.show()
+        self.mainwin.connect("destroy", lambda x: gtk.main_quit())
+
+        gtk.main()
+
 
 if __name__ == "__main__":
-    main()
+    a = CsvDumpApp()
+    a.run()
