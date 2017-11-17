@@ -1,6 +1,4 @@
-#!/usr/bin/env python
-#
-# Copyright 2008 Dan Smith <dsmith@danplanet.com>
+# Copyright 2013 Dan Smith <dsmith@danplanet.com>
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -15,344 +13,271 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-import gobject
-import gtk
-import threading
-import serial
-import os
-
-import csvdump
-from chirp.ui import inputdialog, cloneprog
-
-import chirp
-from chirp import ic9x, id800, ic2820, ic2200, errors
-from chirp import platform
-
-gobject.threads_init()
-
-RADIOS = {"ic9x:A": ic9x.IC9xRadioA,
-          "ic9x:B": ic9x.IC9xRadioB,
-          "id800":  id800.ID800v2Radio,
-          "ic2820": ic2820.IC2820Radio,
-          "ic2200": ic2200.IC2200Radio,
-          }
+from tests.unit import base
+from chirp import chirp_common
+from chirp.drivers import icf
 
 
-class CsvDumpApp:
-    def update_status(self, s):
-        gobject.idle_add(self.progwin.status, s)
+class TestBaseMapping(base.BaseTest):
+    CLS = chirp_common.MemoryMapping
 
-    def _download_img(self):
-        gobject.idle_add(self.progwin.show)
-        fn = "%s.img" % self.rtype
+    def test_mapping(self):
+        model = chirp_common.MappingModel(None, 'Foo')
+        mapping = self.CLS(model, 1, 'Foo')
+        self.assertEqual(str(mapping), 'Foo')
+        self.assertEqual(mapping.get_name(), 'Foo')
+        self.assertEqual(mapping.get_index(), 1)
+        self.assertEqual(repr(mapping), '%s-1' % self.CLS.__name__)
+        self.assertEqual(mapping._model, model)
 
-        try:
-            s = serial.Serial(port=self.rport,
-                              baudrate=RADIOS[self.rtype].BAUD_RATE,
-                              timeout=0.5)
+    def test_mapping_eq(self):
+        mapping1 = self.CLS(None, 1, 'Foo')
+        mapping2 = self.CLS(None, 1, 'Bar')
+        mapping3 = self.CLS(None, 2, 'Foo')
 
-            radio = RADIOS[self.rtype](s)
-            radio.status_fn = self.update_status
-            radio.sync_in()
+        self.assertEqual(mapping1, mapping2)
+        self.assertNotEqual(mapping1, mapping3)
 
-            print "Sync done, saving to: %s" % fn
-            radio.save_mmap(fn)
 
-            self.refresh_radio()
-        except serial.SerialException, e:
-            gobject.idle_add(self.mainwin.set_status,
-                             "Error: Unable to open serial port")
-        except Exception, e:
-            gobject.idle_add(self.mainwin.set_status,
-                             "Error: %s" % e)
+class TestBaseBank(TestBaseMapping):
+    CLS = chirp_common.Bank
 
-        try:
-            s.close()
-        except Exception:
-            pass
 
-        gobject.idle_add(self.progwin.hide)
+class _TestBaseClass(base.BaseTest):
+    ARGS = tuple()
 
-    def download_img(self):
-        t = threading.Thread(target=self._download_img)
-        t.start()
+    def setUp(self):
+        super(_TestBaseClass, self).setUp()
+        self.model = self.CLS(*self.ARGS)
 
-    def _upload_img(self):
-        gobject.idle_add(self.progwin.show)
-        fn = "%s.img" % self.rtype
+    def _test_base(self, method, *args):
+        self.assertRaises(NotImplementedError,
+                          getattr(self.model, method), *args)
 
-        try:
-            s = serial.Serial(port=self.rport,
-                              baudrate=RADIOS[self.rtype].BAUD_RATE,
-                              timeout=0.5)
 
-            radio = RADIOS[self.rtype](s)
-            radio.status_fn = self.update_status
+class TestBaseMappingModel(_TestBaseClass):
+    CLS = chirp_common.MappingModel
+    ARGS = tuple([None, 'Foo'])
 
-            print "Loading image from %s" % fn
-            radio.load_mmap(fn)
+    def test_base_class(self):
+        methods = [('get_num_mappings', ()),
+                   ('get_mappings', ()),
+                   ('add_memory_to_mapping', (None, None)),
+                   ('remove_memory_from_mapping', (None, None)),
+                   ('get_mapping_memories', (None,)),
+                   ('get_memory_mappings', (None,)),
+                   ]
+        for method, args in methods:
+            self._test_base(method, *args)
 
-            radio.sync_out()
-        except Exception, e:
-            gobject.idle_add(self.mainwin.set_status,
-                             "Error: %s" % e)
+    def test_get_name(self):
+        self.assertEqual(self.model.get_name(), 'Foo')
 
-        try:
-            s.close()
-        except Exception:
-            pass
 
-        gobject.idle_add(self.progwin.hide)
+class TestBaseBankModel(TestBaseMappingModel):
+    ARGS = tuple([None])
+    CLS = chirp_common.BankModel
 
-    def upload_img(self):
-        t = threading.Thread(target=self._upload_img)
-        t.start()
+    def test_get_name(self):
+        self.assertEqual(self.model.get_name(), 'Banks')
 
-    def _export_file_mmap(self, fname):
-        count = 0
 
-        try:
-            f = file(fname, "w")
-        except Exception, e:
-            self.mainwin.set_status("%s: %s" % (fname, e))
-            return
+class TestBaseMappingModelIndexInterface(_TestBaseClass):
+    CLS = chirp_common.MappingModelIndexInterface
 
-        print >>f, chirp.chirp_common.Memory.CSV_FORMAT
-        for m in self.radio.get_memories():
-            print >>f, m.to_csv()
-            count += 1
-        f.close()
+    def test_base_class(self):
+        methods = [('get_index_bounds', ()),
+                   ('get_memory_index', (None, None)),
+                   ('set_memory_index', (None, None, None)),
+                   ('get_next_mapping_index', (None,)),
+                   ]
+        for method, args in methods:
+            self._test_base(method, *args)
 
-        self.mainwin.set_status("Exported %i memories" % count)
 
-    def _export_file_live(self, fname, l, h):
-        gobject.idle_add(self.progwin.show)
+class TestIcomBanks(TestBaseMapping):
+    def test_icom_bank(self):
+        bank = icf.IcomBank(None, 1, 'Foo')
+        # IcomBank has an index attribute used by IcomBankModel
+        self.assertTrue(hasattr(bank, 'index'))
 
-        try:
-            f = file(fname, "w")
-        except Exception, e:
-            gobject.idle_add(self.progwin.hide)
-            gobject.idle_add(self.mainwin.set_status, "%s: %s" % (fname, e))
-            return
 
-        print >>f, chirp.chirp_common.Memory.CSV_FORMAT
-        for i in range(l, h+1):
-            s = chirp.chirp_common.Status()
-            s.msg = "Reading memory %i" % i
-            s.cur = i
-            s.max = h+1
-            gobject.idle_add(self.progwin.status, s)
+class TestIcomBankModel(base.BaseTest):
+    CLS = icf.IcomBankModel
 
-            try:
-                m = self.radio.get_memory(i)
-                print >>f, m.to_csv()
-            except chirp.errors.InvalidMemoryLocation:
+    def _get_rf(self):
+        rf = chirp_common.RadioFeatures()
+        rf.memory_bounds = (1, 10)
+        return rf
+
+    def setUp(self):
+        super(TestIcomBankModel, self).setUp()
+
+        class FakeRadio(icf.IcomCloneModeRadio):
+            _num_banks = 10
+            _bank_index_bounds = (0, 10)
+
+            def get_features(the_radio):
+                return self._get_rf()
+
+            def _set_bank(self, number, index):
                 pass
 
-        f.close()
-
-        gobject.idle_add(self.progwin.hide)
-
-    def get_mem_range(self):
-        d = inputdialog.FieldDialog(title="Select Memory Range")
-
-        limit = RADIOS[self.rtype].mem_upper_limit
-
-        la = gtk.Adjustment(0, 0, limit, 1, 10, 10)
-        d.add_field("Start", gtk.SpinButton(la, 0))
-
-        ua = gtk.Adjustment(100, 0, limit, 1, 10, 10)
-        d.add_field("End", gtk.SpinButton(ua, 0))
-
-        r = d.run()
-        low = int(la.get_value())
-        high = int(ua.get_value())
-        d.destroy()
-
-        if r == gtk.RESPONSE_OK:
-            return low, high
-        else:
-            return None, None
-
-    def export_file(self, fname):
-        if not fname.lower().endswith(".csv"):
-            fname += ".csv"
-
-        if self.rtype.startswith("ic9x"):
-            l, h = self.get_mem_range()
-            if l is None or h is None:
-                return
-
-            t = threading.Thread(target=self._export_file_live,
-                                 args=(fname, l, h))
-            t.start()
-        else:
-            self._export_file_mmap(fname)
-
-    def _parse_mem_line(self, line):
-        try:
-            num, name, freq, _ = line.split(",")
-            m = chirp.chirp_common.Memory()
-            m.name = name
-            m.number = int(num)
-            m.freq = float(freq)
-        except Exception, e:
-            print "Failed to parse `%s': %s" % (line, e)
-            return None
-
-        return m
-
-    def _import_file_live(self, fname):
-        gobject.idle_add(self.progwin.show)
-
-        try:
-            f = file(fname, "rU")
-        except Exception, e:
-            gobject.idle_add(self.progwin.hide)
-            gobject.idle_add(self.mainwin.set_status,
-                             "%s: %s" % (fname, e))
-            return
-
-        lines = f.readlines()
-        f.close()
-
-        memories = []
-        lineno = 0
-        for line in lines:
-            try:
-                m = chirp.chirp_common.Memory.from_csv(line)
-            except errors.InvalidMemoryLocation:
-                continue
-            except Exception, e:
-                print "Parse error on line %i: %s" % (lineno, e)
-                break  # FIXME: Report error here
-
-            lineno += 1
-            memories.append(m)
-
-        count = 0
-        for m in memories:
-            s = chirp.chirp_common.Status()
-            s.msg = "Sending memory %i" % m.number
-            s.cur = count
-            s.max = len(memories)
-            gobject.idle_add(self.progwin.status, s)
-
-#            try:
-#                self.radio.get_memory(m.number, 2)
-#            except errors.InvalidMemoryLocation:
-#                m
-
-            try:
-                self.radio.set_memory(m)
-            except Exception, e:
-                print "Error setting memory %i: %s" % (m.number, e)
-                break
-
-            count += 1
-
-        gobject.idle_add(self.progwin.hide)
-
-        gobject.idle_add(self.mainwin.set_status, "Wrote %i memories" % count)
-
-    def _import_file_mmap(self, fname):
-        try:
-            f = file(fname, "rU")
-        except Exception, e:
-            self.progwin.hide()
-            self.mainwin.set_status("%s: %s" % (fname, e))
-            return
-
-        lines = f.readlines()
-        f.close()
-        lineno = 0
-
-        for line in lines:
-            lineno += 1
-            try:
-                m = chirp.chirp_common.Memory.from_csv(line.strip())
-                print "Imported: %s" % m
-            except Exception, e:
-                if lineno == 1:
-                    continue
-                import traceback
-                traceback.print_exc()
-                self.mainwin.set_status("Error on line %i: %s" % (lineno, e))
-                return
-
-            print "Setting memory: %s" % m
-            self.radio.set_memory(m)
-
-        print "Saving image to %s.img" % self.rtype
-        self.radio.save_mmap("%s.img" % self.rtype)
-
-        self.mainwin.set_status("Imported %s" % os.path.basename(fname))
-
-    def import_file(self, fname):
-        if self.rtype.startswith("ic9x"):
-            t = threading.Thread(target=self._import_file_live,
-                                 args=(fname,))
-            t.start()
-        else:
-            self._import_file_mmap(fname)
-
-    def refresh_radio(self):
-        rtype = RADIOS[self.rtype]
-        smsg = "Ready"
-
-        if self.radio:
-            try:
-                self.radio.pipe.close()
-            except Exception, e:
+            def _get_bank(self, number):
                 pass
 
-        if not self.rtype.startswith("ic9x"):
-            mmap = "%s.img" % self.rtype
-            if os.path.isfile(mmap):
-                self.radio = rtype(mmap)
-                self.mainwin.set_image_info(True, True, "Image loaded")
-            else:
-                self.radio = None
-                self.mainwin.set_image_info(False, False, "No image")
-                smsg = "Radio image must be downloaded"
-        else:
-            try:
-                s = serial.Serial(port=self.rport,
-                                  baudrate=rtype.BAUD_RATE,
-                                  timeout=0.1)
-                self.radio = rtype(s)
-                self.mainwin.set_image_info(False, True, "Live")
-            except Exception, e:
-                smsg = "Error: Unable to open serial port"
-                self.mainwin.set_image_info(False, False, "")
+            def _get_bank_index(self, number):
+                pass
 
-        self.mainwin.set_status(smsg)
+            def _set_bank_index(self, number, index):
+                pass
 
-    def select_radio(self, radio, port):
-        self.rtype = radio
-        self.rport = port
-        self.refresh_radio()
+            def get_memory(self, number):
+                pass
 
-    def __init__(self):
-        self.mainwin = csvdump.CsvDumpWindow(self.select_radio,
-                                             self.download_img,
-                                             self.upload_img,
-                                             self.import_file,
-                                             self.export_file)
+        self._radio = FakeRadio(None)
+        self._model = self.CLS(self._radio)
+        self.mox.StubOutWithMock(self._radio, '_set_bank')
+        self.mox.StubOutWithMock(self._radio, '_get_bank')
+        self.mox.StubOutWithMock(self._radio, '_set_bank_index')
+        self.mox.StubOutWithMock(self._radio, '_get_bank_index')
+        self.mox.StubOutWithMock(self._radio, 'get_memory')
 
-        self.progwin = cloneprog.CloneProg()
-        self.progwin.set_transient_for(self.mainwin)
-        self.progwin.set_type_hint(gtk.gdk.WINDOW_TYPE_HINT_DIALOG)
+    def test_get_num_mappings(self):
+        self.assertEqual(self._model.get_num_mappings(), 10)
 
-        self.radio = None
+    def test_get_mappings(self):
+        banks = self._model.get_mappings()
+        self.assertEqual(len(banks), 10)
+        i = 0
+        for bank in banks:
+            index = chr(ord("A") + i)
+            self.assertEqual(bank.get_index(), index)
+            self.assertEqual(bank.get_name(), 'BANK-%s' % index)
+            self.assertEqual(bank.index, i)
+            i += 1
 
-    def run(self):
-        self.mainwin.show()
-        self.mainwin.connect("destroy", lambda x: gtk.main_quit())
+    def test_add_memory_to_mapping(self):
+        mem = chirp_common.Memory()
+        mem.number = 5
+        banks = self._model.get_mappings()
+        bank = banks[2]
+        self._radio._set_bank(5, 2)
+        self.mox.ReplayAll()
+        self._model.add_memory_to_mapping(mem, bank)
 
-        gtk.main()
+    def _setup_test_remove_memory_from_mapping(self, curbank):
+        mem = chirp_common.Memory()
+        mem.number = 5
+        banks = self._model.get_mappings()
+        bank = banks[2]
+        self._radio._get_bank(5).AndReturn(curbank)
+        if curbank == 2:
+            self._radio._set_bank(5, None)
+        self.mox.ReplayAll()
+        return mem, bank
+
+    def test_remove_memory_from_mapping(self):
+        mem, bank = self._setup_test_remove_memory_from_mapping(2)
+        self._model.remove_memory_from_mapping(mem, bank)
+
+    def test_remove_memory_from_mapping_wrong_bank(self):
+        mem, bank = self._setup_test_remove_memory_from_mapping(3)
+        self.assertRaises(Exception,
+                          self._model.remove_memory_from_mapping, mem, bank)
+
+    def test_remove_memory_from_mapping_no_bank(self):
+        mem, bank = self._setup_test_remove_memory_from_mapping(None)
+        self.assertRaises(Exception,
+                          self._model.remove_memory_from_mapping, mem, bank)
+
+    def test_get_mapping_memories(self):
+        banks = self._model.get_mappings()
+        expected = []
+        for i in range(1, 10):
+            should_include = bool(i % 2)
+            self._radio._get_bank(i).AndReturn(
+                should_include and banks[1].index or None)
+            if should_include:
+                self._radio.get_memory(i).AndReturn(i)
+                expected.append(i)
+        self.mox.ReplayAll()
+        members = self._model.get_mapping_memories(banks[1])
+        self.assertEqual(members, expected)
+
+    def test_get_memory_mappings(self):
+        banks = self._model.get_mappings()
+        mem1 = chirp_common.Memory()
+        mem1.number = 5
+        mem2 = chirp_common.Memory()
+        mem2.number = 6
+        self._radio._get_bank(mem1.number).AndReturn(2)
+        self._radio._get_bank(mem2.number).AndReturn(None)
+        self.mox.ReplayAll()
+        self.assertEqual(self._model.get_memory_mappings(mem1)[0], banks[2])
+        self.assertEqual(self._model.get_memory_mappings(mem2), [])
 
 
-if __name__ == "__main__":
-    a = CsvDumpApp()
-    a.run()
+class TestIcomIndexedBankModel(TestIcomBankModel):
+    CLS = icf.IcomIndexedBankModel
+
+    def _get_rf(self):
+        rf = super(TestIcomIndexedBankModel, self)._get_rf()
+        rf.has_bank_index = True
+        return rf
+
+    def test_get_index_bounds(self):
+        self.assertEqual(self._model.get_index_bounds(), (0, 10))
+
+    def test_get_memory_index(self):
+        mem = chirp_common.Memory()
+        mem.number = 5
+        self._radio._get_bank_index(mem.number).AndReturn(1)
+        self.mox.ReplayAll()
+        self.assertEqual(self._model.get_memory_index(mem, None), 1)
+
+    def test_set_memory_index(self):
+        mem = chirp_common.Memory()
+        mem.number = 5
+        banks = self._model.get_mappings()
+        self.mox.StubOutWithMock(self._model, 'get_memory_mappings')
+        self._model.get_memory_mappings(mem).AndReturn([banks[3]])
+        self._radio._set_bank_index(mem.number, 1)
+        self.mox.ReplayAll()
+        self._model.set_memory_index(mem, banks[3], 1)
+
+    def test_set_memory_index_bad_bank(self):
+        mem = chirp_common.Memory()
+        mem.number = 5
+        banks = self._model.get_mappings()
+        self.mox.StubOutWithMock(self._model, 'get_memory_mappings')
+        self._model.get_memory_mappings(mem).AndReturn([banks[4]])
+        self.mox.ReplayAll()
+        self.assertRaises(Exception,
+                          self._model.set_memory_index, mem, banks[3], 1)
+
+    def test_set_memory_index_bad_index(self):
+        mem = chirp_common.Memory()
+        mem.number = 5
+        banks = self._model.get_mappings()
+        self.mox.StubOutWithMock(self._model, 'get_memory_mappings')
+        self._model.get_memory_mappings(mem).AndReturn([banks[3]])
+        self.mox.ReplayAll()
+        self.assertRaises(Exception,
+                          self._model.set_memory_index, mem, banks[3], 99)
+
+    def test_get_next_mapping_index(self):
+        banks = self._model.get_mappings()
+        for i in range(*self._radio.get_features().memory_bounds):
+            self._radio._get_bank(i).AndReturn((i % 2) and banks[1].index)
+            if bool(i % 2):
+                self._radio._get_bank_index(i).AndReturn(i)
+        idx = 0
+        for i in range(*self._radio.get_features().memory_bounds):
+            self._radio._get_bank(i).AndReturn((i % 2) and banks[2].index)
+            if i % 2:
+                self._radio._get_bank_index(i).AndReturn(idx)
+                idx += 1
+        self.mox.ReplayAll()
+        self.assertEqual(self._model.get_next_mapping_index(banks[1]), 0)
+        self.assertEqual(self._model.get_next_mapping_index(banks[2]), 5)
