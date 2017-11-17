@@ -1,4 +1,4 @@
-# Copyright 2011 Dan Smith <dsmith@danplanet.com>
+# Copyright 2008 Dan Smith <dsmith@danplanet.com>
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -13,1552 +13,568 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-"""Wouxun radios management module"""
-
-import time
-import os
+import struct
 import logging
-from chirp import util, chirp_common, bitwise, memmap, errors, directory
-from chirp.settings import RadioSetting, RadioSettingGroup, \
-                RadioSettingValueBoolean, RadioSettingValueList, \
-                RadioSettingValueInteger, RadioSettingValueString, \
-                RadioSettingValueFloat, RadioSettings
-from wouxun_common import wipe_memory, do_download, do_upload
-from textwrap import dedent
+
+from chirp import chirp_common, util, errors, bitwise
+from chirp.memmap import MemoryMap
 
 LOG = logging.getLogger(__name__)
 
-FREQ_ENCODE_TABLE = [0x7, 0xa, 0x0, 0x9, 0xb, 0x2, 0xe, 0x1, 0x3, 0xf]
+TUNING_STEPS = [
+    5.0, 6.25, 8.33,  9.0, 10.0, 12.5, 15, 20, 25, 30, 50, 100, 125, 200
+    ]
+
+MODES = ["FM", "NFM", "WFM", "AM", "DV"]
+DUPLEX = ["", "-", "+"]
+TMODES = ["", "Tone", "TSQL", "TSQL", "DTCS", "DTCS"]
+DTCS_POL = ["NN", "NR", "RN", "RR"]
+
+MEM_LEN = 34
+DV_MEM_LEN = 60
 
 
-def encode_freq(freq):
-    """Convert frequency (4 decimal digits) to wouxun format (2 bytes)"""
-    enc = 0
-    div = 1000
-    for i in range(0, 4):
-        enc <<= 4
-        enc |= FREQ_ENCODE_TABLE[(freq/div) % 10]
-        div /= 10
-    return enc
+# Dirty hack until I clean up this IC9x mess
+class IC9xMemory(chirp_common.Memory):
+    """A dirty hack to stash bank information in a memory"""
+    _bank = None
+    _bank_index = 0
+
+    def __init__(self):
+        chirp_common.Memory.__init__(self)
 
 
-def decode_freq(data):
-    """Convert from wouxun format (2 bytes) to frequency (4 decimal digits)"""
-    freq = 0
-    shift = 12
-    for i in range(0, 4):
-        freq *= 10
-        freq += FREQ_ENCODE_TABLE.index((data >> shift) & 0xf)
-        shift -= 4
-        # LOG.debug("data %04x freq %d shift %d" % (data, freq, shift))
-    return freq
+class IC9xDVMemory(chirp_common.DVMemory):
+    """See above dirty hack"""
+    _bank = None
+    _bank_index = 0
+
+    def __init__(self):
+        chirp_common.DVMemory.__init__(self)
 
 
-@directory.register
-class KGUVD1PRadio(chirp_common.CloneModeRadio,
-                   chirp_common.ExperimentalRadio):
-    """Wouxun KG-UVD1P,UV2,UV3"""
-    VENDOR = "Wouxun"
-    MODEL = "KG-UVD1P"
-    _model = "KG669V"
+def _ic9x_parse_frames(buf):
+    frames = []
 
-    _querymodel = ("HiWOUXUN\x02", "PROGUV6X\x02")
-
-    CHARSET = list("0123456789") + \
-        [chr(x + ord("A")) for x in range(0, 26)] + list("?+-")
-
-    POWER_LEVELS = [chirp_common.PowerLevel("High", watts=5.00),
-                    chirp_common.PowerLevel("Low", watts=1.00)]
-
-    valid_freq = [(136000000, 175000000), (216000000, 520000000)]
-
-    _MEM_FORMAT = """
-        #seekto 0x0010;
-        struct {
-          lbcd rx_freq[4];
-          lbcd tx_freq[4];
-          ul16 rx_tone;
-          ul16 tx_tone;
-          u8 _3_unknown_1:4,
-             bcl:1,
-             _3_unknown_2:3;
-          u8 splitdup:1,
-             skip:1,
-             power_high:1,
-             iswide:1,
-             _2_unknown_2:4;
-          u8 unknown;
-          u8 _0_unknown_1:3,
-             iswidex:1,
-             _0_unknown_2:4;
-        } memory[199];
-
-        #seekto 0x0842;
-        u16 fm_presets_0[9];
-
-        #seekto 0x0882;
-        u16 fm_presets_1[9];
-
-        #seekto 0x0970;
-        struct {
-            u16 vhf_rx_start;
-            u16 vhf_rx_stop;
-            u16 uhf_rx_start;
-            u16 uhf_rx_stop;
-            u16 vhf_tx_start;
-            u16 vhf_tx_stop;
-            u16 uhf_tx_start;
-            u16 uhf_tx_stop;
-        } freq_ranges;
-
-        #seekto 0x0E00;
-        struct {
-          char welcome1[6];
-          char welcome2[6];
-          char single_band[6];
-        } strings;
-
-        #seekto 0x0E20;
-        struct {
-          u8 unknown_flag_01:6,
-             vfo_b_ch_disp:2;
-          u8 unknown_flag_02:5,
-             vfo_a_fr_step:3;
-          u8 unknown_flag_03:4,
-             vfo_a_squelch:4;
-          u8 unknown_flag_04:7,
-             power_save:1;
-          u8 unknown_flag_05:8;
-          u8 unknown_flag_06:6,
-             roger_beep:2;
-          u8 unknown_flag_07:2,
-             transmit_time_out:6;
-          u8 unknown_flag_08:4,
-             vox:4;
-          u8 unknown_1[4];
-          u8 unknown_flag_09:6,
-             voice:2;
-          u8 unknown_flag_10:7,
-             beep:1;
-          u8 unknown_flag_11:7,
-             ani_id_enable:1;
-          u8 unknown_2[2];
-          u8 unknown_flag_12:5,
-             vfo_b_fr_step:3;
-          u8 unknown_3[1];
-          u8 unknown_flag_13:3,
-             ani_id_tx_delay:5;
-          u8 unknown_4[1];
-          u8 unknown_flag_14:6,
-             ani_id_sidetone:2;
-          u8 unknown_flag_15:4,
-             tx_time_out_alert:4;
-          u8 unknown_flag_16:6,
-             vfo_a_ch_disp:2;
-          u8 unknown_flag_15:6,
-             scan_mode:2;
-          u8 unknown_flag_16:7,
-             kbd_lock:1;
-          u8 unknown_flag_17:6,
-             ponmsg:2;
-          u8 unknown_flag_18:5,
-             pf1_function:3;
-          u8 unknown_5[1];
-          u8 unknown_flag_19:7,
-             auto_backlight:1;
-          u8 unknown_flag_20:7,
-             sos_ch:1;
-          u8 unknown_6;
-          u8 sd_available;
-          u8 unknown_flag_21:7,
-             auto_lock_kbd:1;
-          u8 unknown_flag_22:4,
-             vfo_b_squelch:4;
-          u8 unknown_7[1];
-          u8 unknown_flag_23:7,
-             stopwatch:1;
-          u8 vfo_a_cur_chan;
-          u8 unknown_flag_24:7,
-             dual_band_receive:1;
-          u8 current_vfo:1,
-             unknown_flag_24:7;
-          u8 unknown_8[2];
-          u8 mode_password[6];
-          u8 reset_password[6];
-          u8 ani_id_content[6];
-          u8 unknown_flag_25:7,
-             menu_available:1;
-          u8 unknown_9[1];
-          u8 priority_chan;
-          u8 vfo_b_cur_chan;
-        } settings;
-
-        #seekto 0x1008;
-        struct {
-          u8 unknown[8];
-          u8 name[6];
-          u8 pad[2];
-        } names[199];
-    """
-
-    @classmethod
-    def get_prompts(cls):
-        rp = chirp_common.RadioPrompts()
-        rp.experimental = \
-            ('This version of the Wouxun driver allows you to modify the '
-             'frequency range settings of your radio. This has been tested '
-             'and reports from other users indicate that it is a safe '
-             'thing to do. However, modifications to this value may have '
-             'unintended consequences, including damage to your device. '
-             'You have been warned. Proceed at your own risk!')
-        rp.pre_download = _(dedent("""\
-            1. Turn radio off.
-            2. Connect cable to mic/spkr connector.
-            3. Make sure connector is firmly connected.
-            4. Turn radio on.
-            5. Ensure that the radio is tuned to channel with no activity.
-            6. Click OK to download image from device."""))
-        rp.pre_upload = _(dedent("""\
-            1. Turn radio off.
-            2. Connect cable to mic/spkr connector.
-            3. Make sure connector is firmly connected.
-            4. Turn radio on.
-            5. Ensure that the radio is tuned to channel with no activity.
-            6. Click OK to upload image to device."""))
-        return rp
-
-    @classmethod
-    def _get_querymodel(cls):
-        if isinstance(cls._querymodel, str):
-            while True:
-                yield cls._querymodel
-        else:
-            i = 0
-            while True:
-                yield cls._querymodel[i % len(cls._querymodel)]
-                i += 1
-
-    def _identify(self):
-        """Do the original wouxun identification dance"""
-        query = self._get_querymodel()
-        for _i in range(0, 10):
-            self.pipe.write(query.next())
-            resp = self.pipe.read(9)
-            if len(resp) != 9:
-                LOG.debug("Got:\n%s" % util.hexprint(resp))
-                LOG.info("Retrying identification...")
-                time.sleep(1)
-                continue
-            if resp[2:8] != self._model:
-                raise Exception("I can't talk to this model (%s)" %
-                                util.hexprint(resp))
-            return
-        if len(resp) == 0:
-            raise Exception("Radio not responding")
-        else:
-            raise Exception("Unable to identify radio")
-
-    def _start_transfer(self):
-        """Tell the radio to go into transfer mode"""
-        self.pipe.write("\x02\x06")
-        time.sleep(0.05)
-        ack = self.pipe.read(1)
-        if ack != "\x06":
-            raise Exception("Radio refused transfer mode")
-
-    def _download(self):
-        """Talk to an original wouxun and do a download"""
+    while "\xfe\xfe" in buf:
         try:
-            self._identify()
-            self._start_transfer()
-            return do_download(self, 0x0000, 0x2000, 0x0040)
-        except errors.RadioError:
-            raise
+            start = buf.index("\xfe\xfe")
+            end = buf[start:].index("\xfd") + start + 1
         except Exception, e:
-            raise errors.RadioError("Failed to communicate with radio: %s" % e)
+            LOG.error("No trailing bit")
+            break
 
-    def _upload(self):
-        """Talk to an original wouxun and do an upload"""
+        framedata = buf[start:end]
+        buf = buf[end:]
+
         try:
-            self._identify()
-            self._start_transfer()
-            return do_upload(self, 0x0000, 0x2000, 0x0010)
-        except errors.RadioError:
-            raise
-        except Exception, e:
-            raise errors.RadioError("Failed to communicate with radio: %s" % e)
+            frame = IC92Frame()
+            frame.from_raw(framedata[2:-1])
+            frames.append(frame)
+        except errors.InvalidDataError, e:
+            LOG.error("Broken frame: %s" % e)
 
-    def sync_in(self):
-        self._mmap = self._download()
-        self.process_mmap()
+        # LOG.debug("Parsed %i frames" % len(frames))
 
-    def sync_out(self):
-        self._upload()
+    return frames
 
-    def process_mmap(self):
-        if len(self._mmap.get_packed()) != 8192:
-            LOG.info("Fixing old-style Wouxun image")
-            # Originally, CHIRP's wouxun image had eight bytes of
-            # static data, followed by the first memory at offset
-            # 0x0008.  Between 0.1.11 and 0.1.12, this was fixed to 16
-            # bytes of (whatever) followed by the first memory at
-            # offset 0x0010, like the radio actually stores it.  So,
-            # if we find one of those old ones, convert it to the new
-            # format, padding 16 bytes of 0xFF in front.
-            self._mmap = memmap.MemoryMap(
-                    ("\xFF" * 16) + self._mmap.get_packed()[8:8184])
-        self._memobj = bitwise.parse(self._MEM_FORMAT, self._mmap)
 
-    def get_features(self):
-        rf = chirp_common.RadioFeatures()
-        rf.valid_tmodes = ["", "Tone", "TSQL", "DTCS", "Cross"]
-        rf.valid_cross_modes = [
-                        "Tone->Tone",
-                        "Tone->DTCS",
-                        "DTCS->Tone",
-                        "DTCS->",
-                        "->Tone",
-                        "->DTCS",
-                        "DTCS->DTCS",
-                    ]
-        rf.valid_modes = ["FM", "NFM"]
-        rf.valid_power_levels = self.POWER_LEVELS
-        rf.valid_bands = self.valid_freq
-        rf.valid_characters = "".join(self.CHARSET)
-        rf.valid_name_length = 6
-        rf.valid_duplexes = ["", "+", "-", "split", "off"]
-        rf.has_ctone = True
-        rf.has_rx_dtcs = True
-        rf.has_cross = True
-        rf.has_tuning_step = False
-        rf.has_bank = False
-        rf.has_settings = True
-        rf.memory_bounds = (1, 128)
-        rf.can_odd_split = True
-        return rf
+def ic9x_send(pipe, buf):
+    """Send @buf to @pipe, wrapped in a header and trailer.  Attempt to read
+    any response frames, which are returned as a list"""
 
-    def get_settings(self):
-        freq_ranges = RadioSettingGroup("freq_ranges", "Freq Ranges")
-        fm_preset = RadioSettingGroup("fm_preset", "FM Presets")
-        cfg_s = RadioSettingGroup("cfg_settings", "Configuration Settings")
-        group = RadioSettings(cfg_s, freq_ranges, fm_preset)
+    # Add header and trailer
+    realbuf = "\xfe\xfe" + buf + "\xfd"
 
-        rs = RadioSetting("menu_available", "Menu Available",
-                          RadioSettingValueBoolean(
-                              self._memobj.settings.menu_available))
-        cfg_s.append(rs)
+    # LOG.debug("Sending:\n%s" % util.hexprint(realbuf))
 
-        rs = RadioSetting("vhf_rx_start", "1st band RX Lower Limit (MHz)",
-                          RadioSettingValueInteger(
-                              50, 174, decode_freq(
-                                  self._memobj.freq_ranges.vhf_rx_start)))
-        freq_ranges.append(rs)
-        rs = RadioSetting("vhf_rx_stop", "1st band RX Upper Limit (MHz)",
-                          RadioSettingValueInteger(
-                              50, 174, decode_freq(
-                                  self._memobj.freq_ranges.vhf_rx_stop)))
-        freq_ranges.append(rs)
-        rs = RadioSetting("uhf_rx_start", "2nd band RX Lower Limit (MHz)",
-                          RadioSettingValueInteger(
-                              136, 520, decode_freq(
-                                  self._memobj.freq_ranges.uhf_rx_start)))
-        freq_ranges.append(rs)
-        rs = RadioSetting("uhf_rx_stop", "2nd band RX Upper Limit (MHz)",
-                          RadioSettingValueInteger(
-                              136, 520, decode_freq(
-                                  self._memobj.freq_ranges.uhf_rx_stop)))
-        freq_ranges.append(rs)
-        rs = RadioSetting("vhf_tx_start", "1st band TX Lower Limit (MHz)",
-                          RadioSettingValueInteger(
-                              50, 174, decode_freq(
-                                  self._memobj.freq_ranges.vhf_tx_start)))
-        freq_ranges.append(rs)
-        rs = RadioSetting("vhf_tx_stop", "1st TX Upper Limit (MHz)",
-                          RadioSettingValueInteger(
-                              50, 174, decode_freq(
-                                  self._memobj.freq_ranges.vhf_tx_stop)))
-        freq_ranges.append(rs)
-        rs = RadioSetting("uhf_tx_start", "2st band TX Lower Limit (MHz)",
-                          RadioSettingValueInteger(
-                              136, 520, decode_freq(
-                                  self._memobj.freq_ranges.uhf_tx_start)))
-        freq_ranges.append(rs)
-        rs = RadioSetting("uhf_tx_stop", "2st band TX Upper Limit (MHz)",
-                          RadioSettingValueInteger(
-                              136, 520, decode_freq(
-                                  self._memobj.freq_ranges.uhf_tx_stop)))
-        freq_ranges.append(rs)
+    pipe.write(realbuf)
+    pipe.flush()
 
-        # tell the decoded ranges to UI
-        freq_ranges = self._memobj.freq_ranges
-        self.valid_freq = \
-            [(decode_freq(freq_ranges.vhf_rx_start) * 1000000,
-             (decode_freq(freq_ranges.vhf_rx_stop) + 1) * 1000000),
-             (decode_freq(freq_ranges.uhf_rx_start) * 1000000,
-             (decode_freq(freq_ranges.uhf_rx_stop) + 1) * 1000000)]
+    data = ""
+    while True:
+        buf = pipe.read(4096)
+        if not buf:
+            break
 
-        def _filter(name):
-            filtered = ""
-            for char in str(name):
-                if char in chirp_common.CHARSET_ASCII:
-                    filtered += char
-                else:
-                    filtered += " "
-            return filtered
+        data += buf
 
-        # add some radio specific settings
-        options = ["Off", "Welcome", "V bat"]
-        rs = RadioSetting("ponmsg", "Poweron message",
-                          RadioSettingValueList(
-                              options, options[self._memobj.settings.ponmsg]))
-        cfg_s.append(rs)
-        rs = RadioSetting("strings.welcome1", "Power-On Message 1",
-                          RadioSettingValueString(
-                              0, 6, _filter(self._memobj.strings.welcome1)))
-        cfg_s.append(rs)
-        rs = RadioSetting("strings.welcome2", "Power-On Message 2",
-                          RadioSettingValueString(
-                              0, 6, _filter(self._memobj.strings.welcome2)))
-        cfg_s.append(rs)
-        rs = RadioSetting("strings.single_band", "Single Band Message",
-                          RadioSettingValueString(
-                              0, 6, _filter(self._memobj.strings.single_band)))
-        cfg_s.append(rs)
-        options = ["Channel", "ch/freq", "Name", "VFO"]
-        rs = RadioSetting("vfo_a_ch_disp", "VFO A Channel disp mode",
-                          RadioSettingValueList(
-                              options,
-                              options[self._memobj.settings.vfo_a_ch_disp]))
-        cfg_s.append(rs)
-        rs = RadioSetting("vfo_b_ch_disp", "VFO B Channel disp mode",
-                          RadioSettingValueList(
-                              options,
-                              options[self._memobj.settings.vfo_b_ch_disp]))
-        cfg_s.append(rs)
-        options = ["5.0", "6.25", "10.0", "12.5", "25.0", "50.0", "100.0"]
-        rs = RadioSetting("vfo_a_fr_step", "VFO A Frequency Step",
-                          RadioSettingValueList(
-                              options,
-                              options[self._memobj.settings.vfo_a_fr_step]))
-        cfg_s.append(rs)
-        rs = RadioSetting("vfo_b_fr_step", "VFO B Frequency Step",
-                          RadioSettingValueList(
-                              options,
-                              options[self._memobj.settings.vfo_b_fr_step]))
-        cfg_s.append(rs)
-        rs = RadioSetting("vfo_a_squelch", "VFO A Squelch",
-                          RadioSettingValueInteger(
-                              0, 9, self._memobj.settings.vfo_a_squelch))
-        cfg_s.append(rs)
-        rs = RadioSetting("vfo_b_squelch", "VFO B Squelch",
-                          RadioSettingValueInteger(
-                              0, 9, self._memobj.settings.vfo_b_squelch))
-        cfg_s.append(rs)
-        rs = RadioSetting("vfo_a_cur_chan", "VFO A current channel",
-                          RadioSettingValueInteger(
-                              1, 128, self._memobj.settings.vfo_a_cur_chan))
-        cfg_s.append(rs)
-        rs = RadioSetting("vfo_b_cur_chan", "VFO B current channel",
-                          RadioSettingValueInteger(
-                              1, 128, self._memobj.settings.vfo_b_cur_chan))
-        cfg_s.append(rs)
-        rs = RadioSetting("priority_chan", "Priority channel",
-                          RadioSettingValueInteger(
-                              0, 199, self._memobj.settings.priority_chan))
-        cfg_s.append(rs)
-        rs = RadioSetting("power_save", "Power save",
-                          RadioSettingValueBoolean(
-                              self._memobj.settings.power_save))
-        cfg_s.append(rs)
-        options = ["Off", "Scan", "Lamp", "SOS", "Radio"]
-        rs = RadioSetting("pf1_function", "PF1 Function select",
-                          RadioSettingValueList(
-                              options,
-                              options[self._memobj.settings.pf1_function]))
-        cfg_s.append(rs)
-        options = ["Off", "Begin", "End", "Both"]
-        rs = RadioSetting("roger_beep", "Roger beep select",
-                          RadioSettingValueList(
-                              options,
-                              options[self._memobj.settings.roger_beep]))
-        cfg_s.append(rs)
-        options = ["%s" % x for x in range(15, 615, 15)]
-        transmit_time_out = options[self._memobj.settings.transmit_time_out]
-        rs = RadioSetting("transmit_time_out", "TX Time-out Timer",
-                          RadioSettingValueList(
-                              options, transmit_time_out))
-        cfg_s.append(rs)
-        rs = RadioSetting("tx_time_out_alert", "TX Time-out Alert",
-                          RadioSettingValueInteger(
-                              0, 10, self._memobj.settings.tx_time_out_alert))
-        cfg_s.append(rs)
-        rs = RadioSetting("vox", "Vox",
-                          RadioSettingValueInteger(
-                              0, 10, self._memobj.settings.vox))
-        cfg_s.append(rs)
-        options = ["Off", "Chinese", "English"]
-        rs = RadioSetting("voice", "Voice",
-                          RadioSettingValueList(
-                              options, options[self._memobj.settings.voice]))
-        cfg_s.append(rs)
-        rs = RadioSetting("beep", "Beep",
-                          RadioSettingValueBoolean(
-                              self._memobj.settings.beep))
-        cfg_s.append(rs)
-        rs = RadioSetting("ani_id_enable", "ANI id enable",
-                          RadioSettingValueBoolean(
-                              self._memobj.settings.ani_id_enable))
-        cfg_s.append(rs)
-        rs = RadioSetting("ani_id_tx_delay", "ANI id tx delay",
-                          RadioSettingValueInteger(
-                              0, 30, self._memobj.settings.ani_id_tx_delay))
-        cfg_s.append(rs)
-        options = ["Off", "Key", "ANI", "Key+ANI"]
-        rs = RadioSetting("ani_id_sidetone", "ANI id sidetone",
-                          RadioSettingValueList(
-                              options,
-                              options[self._memobj.settings.ani_id_sidetone]))
-        cfg_s.append(rs)
-        options = ["Time", "Carrier", "Search"]
-        rs = RadioSetting("scan_mode", "Scan mode",
-                          RadioSettingValueList(
-                              options,
-                              options[self._memobj.settings.scan_mode]))
-        cfg_s.append(rs)
-        rs = RadioSetting("kbd_lock", "Keyboard lock",
-                          RadioSettingValueBoolean(
-                              self._memobj.settings.kbd_lock))
-        cfg_s.append(rs)
-        rs = RadioSetting("auto_lock_kbd", "Auto lock keyboard",
-                          RadioSettingValueBoolean(
-                              self._memobj.settings.auto_lock_kbd))
-        cfg_s.append(rs)
-        rs = RadioSetting("auto_backlight", "Auto backlight",
-                          RadioSettingValueBoolean(
-                              self._memobj.settings.auto_backlight))
-        cfg_s.append(rs)
-        options = ["CH A", "CH B"]
-        rs = RadioSetting("sos_ch", "SOS CH",
-                          RadioSettingValueList(
-                              options,
-                              options[self._memobj.settings.sos_ch]))
-        cfg_s.append(rs)
-        rs = RadioSetting("stopwatch", "Stopwatch",
-                          RadioSettingValueBoolean(
-                              self._memobj.settings.stopwatch))
-        cfg_s.append(rs)
-        rs = RadioSetting("dual_band_receive", "Dual band receive",
-                          RadioSettingValueBoolean(
-                              self._memobj.settings.dual_band_receive))
-        cfg_s.append(rs)
-        options = ["VFO A", "VFO B"]
-        rs = RadioSetting("current_vfo", "Current VFO",
-                          RadioSettingValueList(
-                              options,
-                              options[self._memobj.settings.current_vfo]))
-        cfg_s.append(rs)
+    return _ic9x_parse_frames(data)
 
-        options = ["Dual", "Single"]
-        rs = RadioSetting("sd_available", "Single/Dual Band",
-                          RadioSettingValueList(
-                              options,
-                              options[self._memobj.settings.sd_available]))
-        cfg_s.append(rs)
 
-        _pwd = self._memobj.settings.mode_password
-        rs = RadioSetting("mode_password", "Mode password (000000 disabled)",
-                          RadioSettingValueInteger(0, 9, _pwd[0]),
-                          RadioSettingValueInteger(0, 9, _pwd[1]),
-                          RadioSettingValueInteger(0, 9, _pwd[2]),
-                          RadioSettingValueInteger(0, 9, _pwd[3]),
-                          RadioSettingValueInteger(0, 9, _pwd[4]),
-                          RadioSettingValueInteger(0, 9, _pwd[5]))
-        cfg_s.append(rs)
-        _pwd = self._memobj.settings.reset_password
-        rs = RadioSetting("reset_password", "Reset password (000000 disabled)",
-                          RadioSettingValueInteger(0, 9, _pwd[0]),
-                          RadioSettingValueInteger(0, 9, _pwd[1]),
-                          RadioSettingValueInteger(0, 9, _pwd[2]),
-                          RadioSettingValueInteger(0, 9, _pwd[3]),
-                          RadioSettingValueInteger(0, 9, _pwd[4]),
-                          RadioSettingValueInteger(0, 9, _pwd[5]))
-        cfg_s.append(rs)
+class IC92Frame:
+    """IC9x frame base class"""
+    def get_vfo(self):
+        """Return the vfo number"""
+        return ord(self._map[0])
 
-        dtmfchars = "0123456789 *#ABCD"
-        _codeobj = self._memobj.settings.ani_id_content
-        _code = "".join([dtmfchars[x] for x in _codeobj if int(x) < 0x1F])
-        val = RadioSettingValueString(0, 6, _code, False)
-        val.set_charset(dtmfchars)
-        rs = RadioSetting("settings.ani_id_content", "PTT-ID Code", val)
+    def set_vfo(self, vfo):
+        """Set the vfo number"""
+        self._map[0] = chr(vfo)
 
-        def apply_ani_id(setting, obj):
-            value = []
-            for j in range(0, 6):
-                try:
-                    value.append(dtmfchars.index(str(setting.value)[j]))
-                except IndexError:
-                    value.append(0xFF)
-            obj.ani_id_content = value
-        rs.set_apply_callback(apply_ani_id, self._memobj.settings)
-        cfg_s.append(rs)
+    def from_raw(self, data):
+        """Construct the frame from raw data"""
+        self._map = MemoryMap(data)
 
-        for i in range(0, 9):
-            if self._memobj.fm_presets_0[i] != 0xFFFF:
-                used = True
-                preset = self._memobj.fm_presets_0[i] / 10.0 + 76
-            else:
-                used = False
-                preset = 76
-            rs = RadioSetting("fm_presets_0_%1i" % i,
-                              "Team 1 Location %i" % (i + 1),
-                              RadioSettingValueBoolean(used),
-                              RadioSettingValueFloat(76, 108, preset, 0.1, 1))
-            fm_preset.append(rs)
-        for i in range(0, 9):
-            if self._memobj.fm_presets_1[i] != 0xFFFF:
-                used = True
-                preset = self._memobj.fm_presets_1[i] / 10.0 + 76
-            else:
-                used = False
-                preset = 76
-            rs = RadioSetting("fm_presets_1_%1i" % i,
-                              "Team 2 Location %i" % (i + 1),
-                              RadioSettingValueBoolean(used),
-                              RadioSettingValueFloat(76, 108, preset, 0.1, 1))
-            fm_preset.append(rs)
+    def from_frame(self, frame):
+        """Construct the frame by copying another frame"""
+        self._map = MemoryMap(frame.get_raw())
 
-        return group
+    def __init__(self, subcmd=0, flen=0, cmd=0x1A):
+        self._map = MemoryMap("\x00" * (4 + flen))
+        self._map[0] = "\x01\x80" + chr(cmd) + chr(subcmd)
 
-    def set_settings(self, settings):
-        for element in settings:
-            if not isinstance(element, RadioSetting):
-                if element.get_name() == "freq_ranges":
-                    self._set_freq_settings(element)
-                elif element.get_name() == "fm_preset":
-                    self._set_fm_preset(element)
-                else:
-                    self.set_settings(element)
-                    continue
-            else:
-                try:
-                    if "." in element.get_name():
-                        bits = element.get_name().split(".")
-                        obj = self._memobj
-                        for bit in bits[:-1]:
-                            obj = getattr(obj, bit)
-                        setting = bits[-1]
-                    else:
-                        obj = self._memobj.settings
-                        setting = element.get_name()
+    def get_payload(self):
+        """Return the entire payload (sans header)"""
+        return self._map[4:]
 
-                    if element.has_apply_callback():
-                        LOG.debug("Using apply callback")
-                        element.run_apply_callback()
-                    else:
-                        LOG.debug("Setting %s = %s" % (setting, element.value))
-                        setattr(obj, setting, element.value)
-                except Exception, e:
-                    LOG.debug(element.get_name())
-                    raise
+    def get_raw(self):
+        """Return the raw version of the frame"""
+        return self._map.get_packed()
 
-    def _set_fm_preset(self, settings):
-        obj = self._memobj
-        for element in settings:
-            try:
-                (bank, index) = \
-                    (int(a) for a in element.get_name().split("_")[-2:])
-                val = element.value
-                if val[0].get_value():
-                    value = int(val[1].get_value()*10-760)
-                else:
-                    value = 0xffff
-                LOG.debug("Setting fm_presets_%1i[%1i] = %s" %
-                          (bank, index, value))
-                if bank == 0:
-                    setting = self._memobj.fm_presets_0
-                else:
-                    setting = self._memobj.fm_presets_1
-                setting[index] = value
-            except Exception, e:
-                LOG.debug(element.get_name())
-                raise
+    def __str__(self):
+        string = "Frame VFO=%i (len = %i)\n" % (self.get_vfo(),
+                                                len(self.get_payload()))
+        string += util.hexprint(self.get_payload())
+        string += "\n"
 
-    def _set_freq_settings(self, settings):
-        for element in settings:
-            try:
-                setattr(self._memobj.freq_ranges,
-                        element.get_name(),
-                        encode_freq(int(element.value)))
-            except Exception, e:
-                LOG.debug(element.get_name())
-                raise
+        return string
 
-    def get_raw_memory(self, number):
-        return repr(self._memobj.memory[number - 1])
+    def send(self, pipe, verbose=False):
+        """Send the frame to the radio via @pipe"""
+        if verbose:
+            LOG.debug("Sending:\n%s" % util.hexprint(self.get_raw()))
 
-    def _get_tone(self, _mem, mem):
-        def _get_dcs(val):
-            code = int("%03o" % (val & 0x07FF))
-            pol = (val & 0x8000) and "R" or "N"
-            return code, pol
+        response = ic9x_send(pipe, self.get_raw())
 
-        tpol = False
-        if _mem.tx_tone != 0xFFFF and _mem.tx_tone > 0x2800:
-            tcode, tpol = _get_dcs(_mem.tx_tone)
-            mem.dtcs = tcode
-            txmode = "DTCS"
-        elif _mem.tx_tone != 0xFFFF:
-            mem.rtone = _mem.tx_tone / 10.0
-            txmode = "Tone"
+        if len(response) == 0:
+            raise errors.InvalidDataError("No response from radio")
+
+        return response[0]
+
+    def __setitem__(self, start, value):
+        self._map[start+4] = value
+
+    def __getitem__(self, index):
+        return self._map[index+4]
+
+    def __getslice__(self, start, end):
+        return self._map[start+4:end+4]
+
+
+class IC92GetBankFrame(IC92Frame):
+    """A frame for requesting bank information"""
+    def __init__(self):
+        IC92Frame.__init__(self, 0x09)
+
+    def send(self, pipe, verbose=False):
+        rframes = ic9x_send(pipe, self.get_raw())
+
+        if len(rframes) == 0:
+            raise errors.InvalidDataError("No response from radio")
+
+        return rframes
+
+
+class IC92BankFrame(IC92Frame):
+    """A frame for bank information"""
+    def __init__(self):
+        # 1 byte for identifier
+        # 8 bytes for name
+        IC92Frame.__init__(self, 0x0B, 9)
+
+    def get_name(self):
+        """Return the bank name"""
+        return self[1:]
+
+    def get_identifier(self):
+        """Return the letter for the bank (A-Z)"""
+        return self[0]
+
+    def set_name(self, name):
+        """Set the bank name"""
+        self[1] = name[:8].ljust(8)
+
+    def set_identifier(self, ident):
+        """Set the letter for the bank (A-Z)"""
+        self[0] = ident[0]
+
+
+class IC92MemClearFrame(IC92Frame):
+    """A frame for clearing (erasing) a memory"""
+    def __init__(self, loc):
+        # 2 bytes for location
+        # 1 byte for 0xFF
+        IC92Frame.__init__(self, 0x00, 4)
+
+        self[0] = struct.pack(">BHB", 1, int("%i" % loc, 16), 0xFF)
+
+
+class IC92MemGetFrame(IC92Frame):
+    """A frame for requesting a memory"""
+    def __init__(self, loc, iscall=False):
+        # 2 bytes for location
+        IC92Frame.__init__(self, 0x00, 3)
+
+        if iscall:
+            call = 2
         else:
-            txmode = ""
+            call = 1
 
-        rpol = False
-        if _mem.rx_tone != 0xFFFF and _mem.rx_tone > 0x2800:
-            rcode, rpol = _get_dcs(_mem.rx_tone)
-            mem.rx_dtcs = rcode
-            rxmode = "DTCS"
-        elif _mem.rx_tone != 0xFFFF:
-            mem.ctone = _mem.rx_tone / 10.0
-            rxmode = "Tone"
+        self[0] = struct.pack(">BH", call, int("%i" % loc, 16))
+
+
+class IC92GetCallsignFrame(IC92Frame):
+    """A frame for getting callsign information"""
+    def __init__(self, calltype, number):
+        IC92Frame.__init__(self, calltype, 1, 0x1D)
+
+        self[0] = chr(number)
+
+
+class IC92CallsignFrame(IC92Frame):
+    """A frame to communicate callsign information"""
+    command = 0  # Invalid
+    width = 8
+
+    def __init__(self, number=0, callsign=""):
+        # 1 byte for index
+        # $width bytes for callsign
+        IC92Frame.__init__(self, self.command, self.width+1, 0x1D)
+
+        self[0] = chr(number) + callsign[:self.width].ljust(self.width)
+
+    def get_callsign(self):
+        """Return the actual callsign"""
+        return self[1:self.width+1].rstrip()
+
+
+class IC92YourCallsignFrame(IC92CallsignFrame):
+    """URCALL frame"""
+    command = 6  # Your
+
+
+class IC92RepeaterCallsignFrame(IC92CallsignFrame):
+    """RPTCALL frame"""
+    command = 7  # Repeater
+
+
+class IC92MyCallsignFrame(IC92CallsignFrame):
+    """MYCALL frame"""
+    command = 8  # My
+    width = 12  # 4 bytes for /STID
+
+MEMORY_FRAME_FORMAT = """
+struct {
+  u8 vfo;
+  bbcd number[2];
+  lbcd freq[5];
+  lbcd offset[4];
+  u8 unknown8;
+  bbcd rtone[2];
+  bbcd ctone[2];
+  bbcd dtcs[2];
+  u8 unknown9[2];
+  u8 unknown2:1,
+     mode:3,
+     tuning_step:4;
+  u8 unknown1:3,
+     tmode: 3,
+     duplex: 2;
+  u8 unknown5:4,
+     dtcs_polarity:2,
+     pskip:1,
+     skip:1;
+  char bank;
+  bbcd bank_index[1];
+  char name[8];
+  u8 unknown10;
+  u8 digital_code;
+  char rpt2call[8];
+  char rpt1call[8];
+  char urcall[8];
+} mem[1];
+"""
+
+
+class IC92MemoryFrame(IC92Frame):
+    """A frame for communicating memory information"""
+    def __init__(self):
+        IC92Frame.__init__(self, 0, DV_MEM_LEN)
+
+        # For good measure, here is a whole, valid memory block
+        # at 146.010 FM.  Since the 9x will complain if any bits
+        # are invalid, it's easiest to start with a known-good one
+        # since we don't set everything.
+        self[0] = \
+            "\x01\x00\x03\x00\x00\x01\x46\x01" + \
+            "\x00\x00\x60\x00\x00\x08\x85\x08" + \
+            "\x85\x00\x23\x22\x80\x06\x00\x00" + \
+            "\x00\x00\x20\x20\x20\x20\x20\x20" + \
+            "\x20\x20\x00\x00\x20\x20\x20\x20" + \
+            "\x20\x20\x20\x20\x4b\x44\x37\x52" + \
+            "\x45\x58\x20\x43\x43\x51\x43\x51" + \
+            "\x43\x51\x20\x20"
+
+    def set_vfo(self, vfo):
+        IC92Frame.set_vfo(self, vfo)
+        if vfo == 1:
+            self._map.truncate(MEM_LEN + 4)
+
+    def set_iscall(self, iscall):
+        """This frame refers to a call channel if @iscall is True"""
+        if iscall:
+            self[0] = 2
         else:
-            rxmode = ""
+            self[0] = 1
 
-        if txmode == "Tone" and not rxmode:
-            mem.tmode = "Tone"
-        elif txmode == rxmode and txmode == "Tone" and mem.rtone == mem.ctone:
-            mem.tmode = "TSQL"
-        elif txmode == rxmode and txmode == "DTCS" and mem.dtcs == mem.rx_dtcs:
-            mem.tmode = "DTCS"
-        elif rxmode or txmode:
-            mem.tmode = "Cross"
-            mem.cross_mode = "%s->%s" % (txmode, rxmode)
+    def get_iscall(self):
+        """Return True if this frame refers to a call channel"""
+        return ord(self[0]) == 2
 
-        # always set it even if no dtcs is used
-        mem.dtcs_polarity = "%s%s" % (tpol or "N", rpol or "N")
+    def set_memory(self, mem):
+        """Take Memory object @mem and configure the frame accordingly"""
+        if mem.number < 0:
+            self.set_iscall(True)
+            mem.number = abs(mem.number) - 1
+            LOG.debug("Memory is %i (call %s)" %
+                      (mem.number, self.get_iscall()))
 
-        LOG.debug("Got TX %s (%i) RX %s (%i)" %
-                  (txmode, _mem.tx_tone, rxmode, _mem.rx_tone))
+        _mem = bitwise.parse(MEMORY_FRAME_FORMAT, self).mem
 
-    def _is_txinh(self, _mem):
-        raw_tx = ""
-        for i in range(0, 4):
-            raw_tx += _mem.tx_freq[i].get_raw()
-        return raw_tx == "\xFF\xFF\xFF\xFF"
+        _mem.number = mem.number
 
-    def get_memory(self, number):
-        _mem = self._memobj.memory[number - 1]
-        _nam = self._memobj.names[number - 1]
+        _mem.freq = mem.freq
+        _mem.offset = mem.offset
+        _mem.rtone = int(mem.rtone * 10)
+        _mem.ctone = int(mem.ctone * 10)
+        _mem.dtcs = int(mem.dtcs)
+        _mem.mode = MODES.index(mem.mode)
+        _mem.tuning_step = TUNING_STEPS.index(mem.tuning_step)
+        _mem.duplex = DUPLEX.index(mem.duplex)
+        _mem.tmode = TMODES.index(mem.tmode)
+        _mem.dtcs_polarity = DTCS_POL.index(mem.dtcs_polarity)
 
-        mem = chirp_common.Memory()
-        mem.number = number
+        if mem._bank is not None:
+            _mem.bank = chr(ord("A") + mem._bank)
+            _mem.bank_index = mem._bank_index
 
-        if _mem.get_raw() == ("\xff" * 16):
-            mem.empty = True
-            return mem
+        _mem.skip = mem.skip == "S"
+        _mem.pskip = mem.skip == "P"
 
-        mem.freq = int(_mem.rx_freq) * 10
-        if _mem.splitdup:
-            mem.duplex = "split"
-        elif self._is_txinh(_mem):
-            mem.duplex = "off"
-        elif int(_mem.rx_freq) < int(_mem.tx_freq):
-            mem.duplex = "+"
-        elif int(_mem.rx_freq) > int(_mem.tx_freq):
-            mem.duplex = "-"
+        _mem.name = mem.name.ljust(8)[:8]
 
-        if mem.duplex == "" or mem.duplex == "off":
-            mem.offset = 0
-        elif mem.duplex == "split":
-            mem.offset = int(_mem.tx_freq) * 10
+        if mem.mode == "DV":
+            _mem.urcall = mem.dv_urcall.upper().ljust(8)[:8]
+            _mem.rpt1call = mem.dv_rpt1call.upper().ljust(8)[:8]
+            _mem.rpt2call = mem.dv_rpt2call.upper().ljust(8)[:8]
+            _mem.digital_code = mem.dv_code
+
+    def get_memory(self):
+        """Return a Memory object based on the contents of the frame"""
+        _mem = bitwise.parse(MEMORY_FRAME_FORMAT, self).mem
+
+        if MODES[_mem.mode] == "DV":
+            mem = IC9xDVMemory()
         else:
-            mem.offset = abs(int(_mem.tx_freq) - int(_mem.rx_freq)) * 10
+            mem = IC9xMemory()
 
-        if not _mem.skip:
+        mem.number = int(_mem.number)
+        if self.get_iscall():
+            mem.number = -1 - mem.number
+
+        mem.freq = int(_mem.freq)
+        mem.offset = int(_mem.offset)
+        mem.rtone = int(_mem.rtone) / 10.0
+        mem.ctone = int(_mem.ctone) / 10.0
+        mem.dtcs = int(_mem.dtcs)
+        mem.mode = MODES[int(_mem.mode)]
+        mem.tuning_step = TUNING_STEPS[int(_mem.tuning_step)]
+        mem.duplex = DUPLEX[int(_mem.duplex)]
+        mem.tmode = TMODES[int(_mem.tmode)]
+        mem.dtcs_polarity = DTCS_POL[int(_mem.dtcs_polarity)]
+
+        if int(_mem.bank) != 0:
+            mem._bank = ord(str(_mem.bank)) - ord("A")
+            mem._bank_index = int(_mem.bank_index)
+
+        if _mem.skip:
             mem.skip = "S"
-        if not _mem.iswide:
-            mem.mode = "NFM"
+        elif _mem.pskip:
+            mem.skip = "P"
+        else:
+            mem.skip = ""
 
-        self._get_tone(_mem, mem)
+        mem.name = str(_mem.name).rstrip()
 
-        mem.power = self.POWER_LEVELS[not _mem.power_high]
-
-        for i in _nam.name:
-            if i == 0xFF:
-                break
-            mem.name += self.CHARSET[i]
-
-        mem.extra = RadioSettingGroup("extra", "Extra")
-        bcl = RadioSetting("bcl", "BCL",
-                           RadioSettingValueBoolean(bool(_mem.bcl)))
-        bcl.set_doc("Busy Channel Lockout")
-        mem.extra.append(bcl)
-
-        options = ["NFM", "FM"]
-        iswidex = RadioSetting("iswidex", "Mode TX(KG-UV6X)",
-                               RadioSettingValueList(
-                                   options, options[_mem.iswidex]))
-        iswidex.set_doc("Mode TX")
-        mem.extra.append(iswidex)
+        if mem.mode == "DV":
+            mem.dv_urcall = str(_mem.urcall).rstrip()
+            mem.dv_rpt1call = str(_mem.rpt1call).rstrip()
+            mem.dv_rpt2call = str(_mem.rpt2call).rstrip()
+            mem.dv_code = int(_mem.digital_code)
 
         return mem
 
-    def _set_tone(self, mem, _mem):
-        def _set_dcs(code, pol):
-            val = int("%i" % code, 8) + 0x2800
-            if pol == "R":
-                val += 0x8000
-            return val
 
-        rx_mode = tx_mode = None
-        rx_tone = tx_tone = 0xFFFF
+def _send_magic_4800(pipe):
+    cmd = "\x01\x80\x19"
+    magic = ("\xFE" * 25) + cmd
+    for _i in [0, 1]:
+        resp = ic9x_send(pipe, magic)
+        if resp:
+            return resp[0].get_raw()[0] == "\x80"
+    return True
 
-        if mem.tmode == "Tone":
-            tx_mode = "Tone"
-            rx_mode = None
-            tx_tone = int(mem.rtone * 10)
-        elif mem.tmode == "TSQL":
-            rx_mode = tx_mode = "Tone"
-            rx_tone = tx_tone = int(mem.ctone * 10)
-        elif mem.tmode == "DTCS":
-            tx_mode = rx_mode = "DTCS"
-            tx_tone = _set_dcs(mem.dtcs, mem.dtcs_polarity[0])
-            rx_tone = _set_dcs(mem.dtcs, mem.dtcs_polarity[1])
-        elif mem.tmode == "Cross":
-            tx_mode, rx_mode = mem.cross_mode.split("->")
-            if tx_mode == "DTCS":
-                tx_tone = _set_dcs(mem.dtcs, mem.dtcs_polarity[0])
-            elif tx_mode == "Tone":
-                tx_tone = int(mem.rtone * 10)
-            if rx_mode == "DTCS":
-                rx_tone = _set_dcs(mem.rx_dtcs, mem.dtcs_polarity[1])
-            elif rx_mode == "Tone":
-                rx_tone = int(mem.ctone * 10)
 
-        _mem.rx_tone = rx_tone
-        _mem.tx_tone = tx_tone
+def _send_magic_38400(pipe):
+    cmd = "\x01\x80\x19"
+    # rsp = "\x80\x01\x19"
+    magic = ("\xFE" * 400) + cmd
+    for _i in [0, 1]:
+        resp = ic9x_send(pipe, magic)
+        if resp:
+            return resp[0].get_raw()[0] == "\x80"
+    return False
 
-        LOG.debug("Set TX %s (%i) RX %s (%i)" %
-                  (tx_mode, _mem.tx_tone, rx_mode, _mem.rx_tone))
 
-    def set_memory(self, mem):
-        _mem = self._memobj.memory[mem.number - 1]
-        _nam = self._memobj.names[mem.number - 1]
-
-        if mem.empty:
-            wipe_memory(_mem, "\xFF")
+def send_magic(pipe):
+    """Send the magic incantation to wake up an ic9x radio"""
+    if pipe.baudrate == 38400:
+        resp = _send_magic_38400(pipe)
+        if resp:
             return
-
-        if _mem.get_raw() == ("\xFF" * 16):
-            wipe_memory(_mem, "\x00")
-
-        _mem.rx_freq = int(mem.freq / 10)
-        if mem.duplex == "split":
-            _mem.tx_freq = int(mem.offset / 10)
-        elif mem.duplex == "off":
-            for i in range(0, 4):
-                _mem.tx_freq[i].set_raw("\xFF")
-        elif mem.duplex == "+":
-            _mem.tx_freq = int(mem.freq / 10) + int(mem.offset / 10)
-        elif mem.duplex == "-":
-            _mem.tx_freq = int(mem.freq / 10) - int(mem.offset / 10)
-        else:
-            _mem.tx_freq = int(mem.freq / 10)
-        _mem.splitdup = mem.duplex == "split"
-        _mem.skip = mem.skip != "S"
-        _mem.iswide = mem.mode != "NFM"
-
-        self._set_tone(mem, _mem)
-
-        if mem.power:
-            _mem.power_high = not self.POWER_LEVELS.index(mem.power)
-        else:
-            _mem.power_high = True
-
-        _nam.name = [0xFF] * 6
-        for i in range(0, len(mem.name)):
-            try:
-                _nam.name[i] = self.CHARSET.index(mem.name[i])
-            except IndexError:
-                raise Exception("Character `%s' not supported")
-
-        for setting in mem.extra:
-            setattr(_mem, setting.get_name(), setting.value)
-
-    @classmethod
-    def match_model(cls, filedata, filename):
-        # New-style image (CHIRP 0.1.12)
-        if len(filedata) == 8192 and \
-                filedata[0x60:0x64] != "2009" and \
-                filedata[0x170:0x173] != "LX-" and \
-                filedata[0x1f77:0x1f7d] == "\xff\xff\xff\xff\xff\xff" and \
-                filedata[0x0d70:0x0d80] == "\xff\xff\xff\xff\xff\xff\xff\xff" \
-                                           "\xff\xff\xff\xff\xff\xff\xff\xff":
-                # those areas are (seems to be) unused
-            return True
-        # Old-style image (CHIRP 0.1.11)
-        if len(filedata) == 8200 and \
-                filedata[0:4] == "\x01\x00\x00\x00":
-            return True
-        return False
+        LOG.info("Switching from 38400 to 4800")
+        pipe.baudrate = 4800
+        resp = _send_magic_4800(pipe)
+        pipe.baudrate = 38400
+        if resp:
+            return
+        raise errors.RadioError("Radio not responding")
+    elif pipe.baudrate == 4800:
+        resp = _send_magic_4800(pipe)
+        if resp:
+            return
+        LOG.info("Switching from 4800 to 38400")
+        pipe.baudrate = 38400
+        resp = _send_magic_38400(pipe)
+        if resp:
+            return
+        pipe.baudrate = 4800
+        raise errors.RadioError("Radio not responding")
+    else:
+        raise errors.InvalidDataError("Radio in unknown state (%i)" %
+                                      pipe.baudrate)
 
 
-@directory.register
-class KGUV6DRadio(KGUVD1PRadio):
-    """Wouxun KG-UV6 (D and X variants)"""
-    MODEL = "KG-UV6"
+def get_memory_frame(pipe, vfo, number):
+    """Get the memory frame for @vfo and @number via @pipe"""
+    if number < 0:
+        number = abs(number + 1)
+        call = True
+    else:
+        call = False
 
-    _querymodel = ("HiWXUVD1\x02", "HiKGUVD1\x02")
+    frame = IC92MemGetFrame(number, call)
+    frame.set_vfo(vfo)
 
-    _MEM_FORMAT = """
-        #seekto 0x0010;
-        struct {
-          lbcd rx_freq[4];
-          lbcd tx_freq[4];
-          ul16 rx_tone;
-          ul16 tx_tone;
-          u8 _3_unknown_1:4,
-             bcl:1,
-             _3_unknown_2:3;
-          u8 splitdup:1,
-             skip:1,
-             power_high:1,
-             iswide:1,
-             _2_unknown_2:4;
-          u8 pad;
-          u8 _0_unknown_1:3,
-             iswidex:1,
-             _0_unknown_2:4;
-        } memory[199];
-
-        #seekto 0x0F00;
-        struct {
-          char welcome1[6];
-          char welcome2[6];
-          char single_band[6];
-        } strings;
-
-        #seekto 0x0F20;
-        struct {
-          u8 unknown_flag_01:6,
-             vfo_b_ch_disp:2;
-          u8 unknown_flag_02:5,
-             vfo_a_fr_step:3;
-          u8 unknown_flag_03:4,
-             vfo_a_squelch:4;
-          u8 unknown_flag_04:7,
-             power_save:1;
-          u8 unknown_flag_05:5,
-             pf2_function:3;
-          u8 unknown_flag_06:6,
-             roger_beep:2;
-          u8 unknown_flag_07:2,
-             transmit_time_out:6;
-          u8 unknown_flag_08:4,
-             vox:4;
-          u8 unknown_1[4];
-          u8 unknown_flag_09:6,
-             voice:2;
-          u8 unknown_flag_10:7,
-             beep:1;
-          u8 unknown_flag_11:7,
-             ani_id_enable:1;
-          u8 unknown_2[2];
-          u8 unknown_flag_12:5,
-             vfo_b_fr_step:3;
-          u8 unknown_3[1];
-          u8 unknown_flag_13:3,
-             ani_id_tx_delay:5;
-          u8 unknown_4[1];
-          u8 unknown_flag_14:6,
-             ani_id_sidetone:2;
-          u8 unknown_flag_15:4,
-             tx_time_out_alert:4;
-          u8 unknown_flag_16:6,
-             vfo_a_ch_disp:2;
-          u8 unknown_flag_15:6,
-             scan_mode:2;
-          u8 unknown_flag_16:7,
-             kbd_lock:1;
-          u8 unknown_flag_17:6,
-             ponmsg:2;
-          u8 unknown_flag_18:5,
-             pf1_function:3;
-          u8 unknown_5[1];
-          u8 unknown_flag_19:7,
-             auto_backlight:1;
-          u8 unknown_flag_20:7,
-             sos_ch:1;
-          u8 unknown_6;
-          u8 sd_available;
-          u8 unknown_flag_21:7,
-             auto_lock_kbd:1;
-          u8 unknown_flag_22:4,
-             vfo_b_squelch:4;
-          u8 unknown_7[1];
-          u8 unknown_flag_23:7,
-             stopwatch:1;
-          u8 vfo_a_cur_chan;
-          u8 unknown_flag_24:7,
-             dual_band_receive:1;
-          u8 current_vfo:1,
-             unknown_flag_24:7;
-          u8 unknown_8[2];
-          u8 mode_password[6];
-          u8 reset_password[6];
-          u8 ani_id_content[6];
-          u8 unknown_flag_25:7,
-             menu_available:1;
-          u8 unknown_9[1];
-          u8 priority_chan;
-          u8 vfo_b_cur_chan;
-        } settings;
-
-        #seekto 0x0f60;
-        struct {
-          lbcd rx_freq[4];
-          lbcd tx_freq[4];
-          ul16 rx_tone;
-          ul16 tx_tone;
-          u8 _3_unknown_3:4,
-             bcl:1,
-             _3_unknown_4:3;
-          u8 splitdup:1,
-             _2_unknown_3:1,
-             power_high:1,
-             iswide:1,
-             _2_unknown_4:4;
-          u8 pad[2];
-        } vfo_settings[2];
-
-        #seekto 0x0f82;
-        u16 fm_presets_0[9];
-
-        #seekto 0x0ff0;
-        struct {
-            u16 vhf_rx_start;
-            u16 vhf_rx_stop;
-            u16 uhf_rx_start;
-            u16 uhf_rx_stop;
-            u16 vhf_tx_start;
-            u16 vhf_tx_stop;
-            u16 uhf_tx_start;
-            u16 uhf_tx_stop;
-        } freq_ranges;
-
-        #seekto 0x1010;
-        struct {
-          u8 name[6];
-          u8 pad[10];
-        } names[199];
-
-        #seekto 0x1f60;
-        struct {
-            u8 unknown_flag_26:6,
-               tx_offset_dir:2;
-            u8 tx_offset[6];
-            u8 pad[9];
-        } vfo_offset[2];
-
-        #seekto 0x1f82;
-        u16 fm_presets_1[9];
-    """
-
-    def get_features(self):
-        rf = KGUVD1PRadio.get_features(self)
-        rf.memory_bounds = (1, 199)
-        return rf
-
-    def get_settings(self):
-        freq_ranges = RadioSettingGroup("freq_ranges", "Freq Ranges")
-        fm_preset = RadioSettingGroup("fm_preset", "FM Presets")
-        cfg_s = RadioSettingGroup("cfg_settings", "Configuration Settings")
-        group = RadioSettings(cfg_s, freq_ranges, fm_preset)
-
-        rs = RadioSetting("menu_available", "Menu Available",
-                          RadioSettingValueBoolean(
-                              self._memobj.settings.menu_available))
-        cfg_s.append(rs)
-
-        rs = RadioSetting("vhf_rx_start", "VHF RX Lower Limit (MHz)",
-                          RadioSettingValueInteger(
-                              1, 1000, decode_freq(
-                                  self._memobj.freq_ranges.vhf_rx_start)))
-        freq_ranges.append(rs)
-        rs = RadioSetting("vhf_rx_stop", "VHF RX Upper Limit (MHz)",
-                          RadioSettingValueInteger(
-                              1, 1000, decode_freq(
-                                  self._memobj.freq_ranges.vhf_rx_stop)))
-        freq_ranges.append(rs)
-        rs = RadioSetting("uhf_rx_start", "UHF RX Lower Limit (MHz)",
-                          RadioSettingValueInteger(
-                              1, 1000, decode_freq(
-                                  self._memobj.freq_ranges.uhf_rx_start)))
-        freq_ranges.append(rs)
-        rs = RadioSetting("uhf_rx_stop", "UHF RX Upper Limit (MHz)",
-                          RadioSettingValueInteger(
-                              1, 1000, decode_freq(
-                                  self._memobj.freq_ranges.uhf_rx_stop)))
-        freq_ranges.append(rs)
-        rs = RadioSetting("vhf_tx_start", "VHF TX Lower Limit (MHz)",
-                          RadioSettingValueInteger(
-                              1, 1000, decode_freq(
-                                  self._memobj.freq_ranges.vhf_tx_start)))
-        freq_ranges.append(rs)
-        rs = RadioSetting("vhf_tx_stop", "VHF TX Upper Limit (MHz)",
-                          RadioSettingValueInteger(
-                              1, 1000, decode_freq(
-                                  self._memobj.freq_ranges.vhf_tx_stop)))
-        freq_ranges.append(rs)
-        rs = RadioSetting("uhf_tx_start", "UHF TX Lower Limit (MHz)",
-                          RadioSettingValueInteger(
-                              1, 1000, decode_freq(
-                                  self._memobj.freq_ranges.uhf_tx_start)))
-        freq_ranges.append(rs)
-        rs = RadioSetting("uhf_tx_stop", "UHF TX Upper Limit (MHz)",
-                          RadioSettingValueInteger(
-                              1, 1000, decode_freq(
-                                  self._memobj.freq_ranges.uhf_tx_stop)))
-        freq_ranges.append(rs)
-
-        # tell the decoded ranges to UI
-        freq_ranges = self._memobj.freq_ranges
-        self.valid_freq = \
-            [(decode_freq(freq_ranges.vhf_rx_start) * 1000000,
-             (decode_freq(freq_ranges.vhf_rx_stop) + 1) * 1000000),
-             (decode_freq(freq_ranges.uhf_rx_start) * 1000000,
-             (decode_freq(freq_ranges.uhf_rx_stop) + 1) * 1000000)]
-
-        def _filter(name):
-            filtered = ""
-            for char in str(name):
-                if char in chirp_common.CHARSET_ASCII:
-                    filtered += char
-                else:
-                    filtered += " "
-            return filtered
-
-        # add some radio specific settings
-        options = ["Off", "Welcome", "V bat", "N/A(KG-UV6X)"]
-        rs = RadioSetting("ponmsg", "Poweron message",
-                          RadioSettingValueList(
-                              options, options[self._memobj.settings.ponmsg]))
-        cfg_s.append(rs)
-        rs = RadioSetting("strings.welcome1", "Power-On Message 1",
-                          RadioSettingValueString(
-                              0, 6, _filter(self._memobj.strings.welcome1)))
-        cfg_s.append(rs)
-        rs = RadioSetting("strings.welcome2", "Power-On Message 2",
-                          RadioSettingValueString(
-                              0, 6, _filter(self._memobj.strings.welcome2)))
-        cfg_s.append(rs)
-        rs = RadioSetting("strings.single_band", "Single Band Message",
-                          RadioSettingValueString(
-                              0, 6, _filter(self._memobj.strings.single_band)))
-        cfg_s.append(rs)
-        options = ["Channel", "ch/freq", "Name", "VFO"]
-        rs = RadioSetting("vfo_a_ch_disp", "VFO A Channel disp mode",
-                          RadioSettingValueList(
-                              options,
-                              options[self._memobj.settings.vfo_a_ch_disp]))
-        cfg_s.append(rs)
-        rs = RadioSetting("vfo_b_ch_disp", "VFO B Channel disp mode",
-                          RadioSettingValueList(
-                              options,
-                              options[self._memobj.settings.vfo_b_ch_disp]))
-        cfg_s.append(rs)
-        options = \
-            ["2.5", "5.0", "6.25", "10.0", "12.5", "25.0", "50.0", "100.0"]
-        rs = RadioSetting("vfo_a_fr_step", "VFO A Frequency Step",
-                          RadioSettingValueList(
-                              options,
-                              options[self._memobj.settings.vfo_a_fr_step]))
-        cfg_s.append(rs)
-        rs = RadioSetting("vfo_b_fr_step", "VFO B Frequency Step",
-                          RadioSettingValueList(
-                              options,
-                              options[self._memobj.settings.vfo_b_fr_step]))
-        cfg_s.append(rs)
-        rs = RadioSetting("vfo_a_squelch", "VFO A Squelch",
-                          RadioSettingValueInteger(
-                              0, 9, self._memobj.settings.vfo_a_squelch))
-        cfg_s.append(rs)
-        rs = RadioSetting("vfo_b_squelch", "VFO B Squelch",
-                          RadioSettingValueInteger(
-                              0, 9, self._memobj.settings.vfo_b_squelch))
-        cfg_s.append(rs)
-        rs = RadioSetting("vfo_a_cur_chan", "VFO A current channel",
-                          RadioSettingValueInteger(
-                              1, 199, self._memobj.settings.vfo_a_cur_chan))
-        cfg_s.append(rs)
-        rs = RadioSetting("vfo_b_cur_chan", "VFO B current channel",
-                          RadioSettingValueInteger(
-                              1, 199, self._memobj.settings.vfo_b_cur_chan))
-        cfg_s.append(rs)
-        rs = RadioSetting("priority_chan", "Priority channel",
-                          RadioSettingValueInteger(
-                              0, 199, self._memobj.settings.priority_chan))
-        cfg_s.append(rs)
-        rs = RadioSetting("power_save", "Power save",
-                          RadioSettingValueBoolean(
-                              self._memobj.settings.power_save))
-        cfg_s.append(rs)
-        options = ["Off", "Scan", "Lamp", "SOS", "Radio"]
-        rs = RadioSetting("pf1_function", "PF1 Function select",
-                          RadioSettingValueList(
-                              options,
-                              options[self._memobj.settings.pf1_function]))
-        cfg_s.append(rs)
-        options = ["Off", "Radio", "fr/ch", "Rpt", "Stopwatch", "Lamp", "SOS"]
-        rs = RadioSetting("pf2_function", "PF2 Function select",
-                          RadioSettingValueList(
-                              options,
-                              options[self._memobj.settings.pf2_function]))
-        cfg_s.append(rs)
-        options = ["Off", "Begin", "End", "Both"]
-        rs = RadioSetting("roger_beep", "Roger beep select",
-                          RadioSettingValueList(
-                              options,
-                              options[self._memobj.settings.roger_beep]))
-        cfg_s.append(rs)
-        options = ["%s" % x for x in range(15, 615, 15)]
-        transmit_time_out = options[self._memobj.settings.transmit_time_out]
-        rs = RadioSetting("transmit_time_out", "TX Time-out Timer",
-                          RadioSettingValueList(
-                              options, transmit_time_out))
-        cfg_s.append(rs)
-        rs = RadioSetting("tx_time_out_alert", "TX Time-out Alert",
-                          RadioSettingValueInteger(
-                              0, 10, self._memobj.settings.tx_time_out_alert))
-        cfg_s.append(rs)
-        rs = RadioSetting("vox", "Vox",
-                          RadioSettingValueInteger(
-                              0, 10, self._memobj.settings.vox))
-        cfg_s.append(rs)
-        options = ["Off", "Chinese", "English"]
-        rs = RadioSetting("voice", "Voice",
-                          RadioSettingValueList(
-                              options, options[self._memobj.settings.voice]))
-        cfg_s.append(rs)
-        rs = RadioSetting("beep", "Beep",
-                          RadioSettingValueBoolean(
-                              self._memobj.settings.beep))
-        cfg_s.append(rs)
-        rs = RadioSetting("ani_id_enable", "ANI id enable",
-                          RadioSettingValueBoolean(
-                              self._memobj.settings.ani_id_enable))
-        cfg_s.append(rs)
-        rs = RadioSetting("ani_id_tx_delay", "ANI id tx delay",
-                          RadioSettingValueInteger(
-                              0, 30, self._memobj.settings.ani_id_tx_delay))
-        cfg_s.append(rs)
-        options = ["Off", "Key", "ANI", "Key+ANI"]
-        rs = RadioSetting("ani_id_sidetone", "ANI id sidetone",
-                          RadioSettingValueList(
-                              options,
-                              options[self._memobj.settings.ani_id_sidetone]))
-        cfg_s.append(rs)
-        options = ["Time", "Carrier", "Search"]
-        rs = RadioSetting("scan_mode", "Scan mode",
-                          RadioSettingValueList(
-                              options,
-                              options[self._memobj.settings.scan_mode]))
-        cfg_s.append(rs)
-        rs = RadioSetting("kbd_lock", "Keyboard lock",
-                          RadioSettingValueBoolean(
-                              self._memobj.settings.kbd_lock))
-        cfg_s.append(rs)
-        rs = RadioSetting("auto_lock_kbd", "Auto lock keyboard",
-                          RadioSettingValueBoolean(
-                              self._memobj.settings.auto_lock_kbd))
-        cfg_s.append(rs)
-        rs = RadioSetting("auto_backlight", "Auto backlight",
-                          RadioSettingValueBoolean(
-                              self._memobj.settings.auto_backlight))
-        cfg_s.append(rs)
-        options = ["CH A", "CH B"]
-        rs = RadioSetting("sos_ch", "SOS CH",
-                          RadioSettingValueList(
-                              options, options[self._memobj.settings.sos_ch]))
-        cfg_s.append(rs)
-        rs = RadioSetting("stopwatch", "Stopwatch",
-                          RadioSettingValueBoolean(
-                              self._memobj.settings.stopwatch))
-        cfg_s.append(rs)
-        rs = RadioSetting("dual_band_receive", "Dual band receive",
-                          RadioSettingValueBoolean(
-                              self._memobj.settings.dual_band_receive))
-        cfg_s.append(rs)
-        options = ["VFO A", "VFO B"]
-        rs = RadioSetting("current_vfo", "Current VFO",
-                          RadioSettingValueList(
-                              options,
-                              options[self._memobj.settings.current_vfo]))
-        cfg_s.append(rs)
-
-        options = ["Dual", "Single"]
-        rs = RadioSetting("sd_available", "Single/Dual Band",
-                          RadioSettingValueList(
-                              options,
-                              options[self._memobj.settings.sd_available]))
-        cfg_s.append(rs)
-
-        _pwd = self._memobj.settings.mode_password
-        rs = RadioSetting("mode_password", "Mode password (000000 disabled)",
-                          RadioSettingValueInteger(0, 9, _pwd[0]),
-                          RadioSettingValueInteger(0, 9, _pwd[1]),
-                          RadioSettingValueInteger(0, 9, _pwd[2]),
-                          RadioSettingValueInteger(0, 9, _pwd[3]),
-                          RadioSettingValueInteger(0, 9, _pwd[4]),
-                          RadioSettingValueInteger(0, 9, _pwd[5]))
-        cfg_s.append(rs)
-        _pwd = self._memobj.settings.reset_password
-        rs = RadioSetting("reset_password", "Reset password (000000 disabled)",
-                          RadioSettingValueInteger(0, 9, _pwd[0]),
-                          RadioSettingValueInteger(0, 9, _pwd[1]),
-                          RadioSettingValueInteger(0, 9, _pwd[2]),
-                          RadioSettingValueInteger(0, 9, _pwd[3]),
-                          RadioSettingValueInteger(0, 9, _pwd[4]),
-                          RadioSettingValueInteger(0, 9, _pwd[5]))
-        cfg_s.append(rs)
-
-        dtmfchars = "0123456789 *#ABCD"
-        _codeobj = self._memobj.settings.ani_id_content
-        _code = "".join([dtmfchars[x] for x in _codeobj if int(x) < 0x1F])
-        val = RadioSettingValueString(0, 6, _code, False)
-        val.set_charset(dtmfchars)
-        rs = RadioSetting("settings.ani_id_content", "ANI Code", val)
-
-        def apply_ani_id(setting, obj):
-            value = []
-            for j in range(0, 6):
-                try:
-                    value.append(dtmfchars.index(str(setting.value)[j]))
-                except IndexError:
-                    value.append(0xFF)
-            obj.ani_id_content = value
-        rs.set_apply_callback(apply_ani_id, self._memobj.settings)
-        cfg_s.append(rs)
-
-        for i in range(0, 9):
-            if self._memobj.fm_presets_0[i] != 0xFFFF:
-                used = True
-                preset = self._memobj.fm_presets_0[i]/10.0+76
-            else:
-                used = False
-                preset = 76
-            rs = RadioSetting("fm_presets_0_%1i" % i,
-                              "Team 1 Location %i" % (i+1),
-                              RadioSettingValueBoolean(used),
-                              RadioSettingValueFloat(76, 108, preset, 0.1, 1))
-            fm_preset.append(rs)
-        for i in range(0, 9):
-            if self._memobj.fm_presets_1[i] != 0xFFFF:
-                used = True
-                preset = self._memobj.fm_presets_1[i]/10.0+76
-            else:
-                used = False
-                preset = 76
-            rs = RadioSetting("fm_presets_1_%1i" % i,
-                              "Team 2 Location %i" % (i+1),
-                              RadioSettingValueBoolean(used),
-                              RadioSettingValueFloat(76, 108, preset, 0.1, 1))
-            fm_preset.append(rs)
-
-        return group
-
-    def set_settings(self, settings):
-        for element in settings:
-            if not isinstance(element, RadioSetting):
-                if element.get_name() == "freq_ranges":
-                    self._set_freq_settings(element)
-                elif element.get_name() == "fm_preset":
-                    self._set_fm_preset(element)
-                else:
-                    self.set_settings(element)
-            else:
-                try:
-                    if "." in element.get_name():
-                        bits = element.get_name().split(".")
-                        obj = self._memobj
-                        for bit in bits[:-1]:
-                            obj = getattr(obj, bit)
-                        setting = bits[-1]
-                    else:
-                        obj = self._memobj.settings
-                        setting = element.get_name()
-
-                    if element.has_apply_callback():
-                        LOG.debug("Using apply callback")
-                        element.run_apply_callback()
-                    else:
-                        LOG.debug("Setting %s = %s" % (setting, element.value))
-                        setattr(obj, setting, element.value)
-                except Exception, e:
-                    LOG.debug(element.get_name())
-                    raise
-
-    def _set_fm_preset(self, settings):
-        obj = self._memobj
-        for element in settings:
-            try:
-                (bank, index) = \
-                    (int(a) for a in element.get_name().split("_")[-2:])
-                val = element.value
-                if val[0].get_value():
-                    value = int(val[1].get_value()*10-760)
-                else:
-                    value = 0xffff
-                LOG.debug("Setting fm_presets_%1i[%1i] = %s" %
-                          (bank, index, value))
-                if bank == 0:
-                    setting = self._memobj.fm_presets_0
-                else:
-                    setting = self._memobj.fm_presets_1
-                setting[index] = value
-            except Exception, e:
-                LOG.debug(element.get_name())
-                raise
-
-    @classmethod
-    def match_model(cls, filedata, filename):
-        if len(filedata) == 8192 and \
-                filedata[0x1f77:0x1f7d] == "WELCOM":
-            return True
-        return False
+    return frame.send(pipe)
 
 
-@directory.register
-class KG816Radio(KGUVD1PRadio, chirp_common.ExperimentalRadio):
-    """Wouxun KG-816"""
-    MODEL = "KG-816"
+def get_memory(pipe, vfo, number):
+    """Get a memory object for @vfo and @number via @pipe"""
+    rframe = get_memory_frame(pipe, vfo, number)
 
-    _querymodel = "HiWOUXUN\x02"
+    if len(rframe.get_payload()) < 1:
+        raise errors.InvalidMemoryLocation("No response from radio")
 
-    _MEM_FORMAT = """
-        #seekto 0x0010;
-        struct {
-          lbcd rx_freq[4];
-          lbcd tx_freq[4];
-          ul16 rx_tone;
-          ul16 tx_tone;
-          u8 _3_unknown_1:4,
-             bcl:1,
-             _3_unknown_2:3;
-          u8 splitdup:1,
-             skip:1,
-             power_high:1,
-             iswide:1,
-             _2_unknown_2:4;
-          u8 unknown;
-          u8 _0_unknown_1:3,
-             iswidex:1,
-             _0_unknown_2:4;
-        } memory[199];
+    if rframe.get_payload()[3] == '\xff':
+        raise errors.InvalidMemoryLocation("Radio says location is empty")
 
-        #seekto 0x0d70;
-        struct {
-            u16 vhf_rx_start;
-            u16 vhf_rx_stop;
-            u16 uhf_rx_start;
-            u16 uhf_rx_stop;
-            u16 vhf_tx_start;
-            u16 vhf_tx_stop;
-            u16 uhf_tx_start;
-            u16 uhf_tx_stop;
-        } freq_ranges;
+    mf = IC92MemoryFrame()
+    mf.from_frame(rframe)
 
-        #seekto 0x1010;
-        struct {
-            u8 name[6];
-            u8 pad[10];
-        } names[199];
-    """
-
-    @classmethod
-    def get_experimental_warning(cls):
-        return ('We have not that much information on this model '
-                'up to now we only know it has the same memory '
-                'organization of KGUVD1 but uses 199 memories. '
-                'it has been reported to work but '
-                'proceed at your own risk!')
-
-    def get_features(self):
-        rf = KGUVD1PRadio.get_features(self)
-        rf.memory_bounds = (1, 199)  # this is the only known difference
-        return rf
-
-    def get_settings(self):
-        freq_ranges = RadioSettingGroup("freq_ranges",
-                                        "Freq Ranges (read only)")
-        group = RadioSettings(freq_ranges)
-
-        rs = RadioSetting("vhf_rx_start", "vhf rx start",
-                          RadioSettingValueInteger(
-                              66, 520, decode_freq(
-                                  self._memobj.freq_ranges.vhf_rx_start)))
-        freq_ranges.append(rs)
-        rs = RadioSetting("vhf_rx_stop", "vhf rx stop",
-                          RadioSettingValueInteger(
-                              66, 520, decode_freq(
-                                  self._memobj.freq_ranges.vhf_rx_stop)))
-        freq_ranges.append(rs)
-        rs = RadioSetting("uhf_rx_start", "uhf rx start",
-                          RadioSettingValueInteger(
-                              66, 520, decode_freq(
-                                  self._memobj.freq_ranges.uhf_rx_start)))
-        freq_ranges.append(rs)
-        rs = RadioSetting("uhf_rx_stop", "uhf rx stop",
-                          RadioSettingValueInteger(
-                              66, 520, decode_freq(
-                                  self._memobj.freq_ranges.uhf_rx_stop)))
-        freq_ranges.append(rs)
-        rs = RadioSetting("vhf_tx_start", "vhf tx start",
-                          RadioSettingValueInteger(
-                              66, 520, decode_freq(
-                                  self._memobj.freq_ranges.vhf_tx_start)))
-        freq_ranges.append(rs)
-        rs = RadioSetting("vhf_tx_stop", "vhf tx stop",
-                          RadioSettingValueInteger(
-                              66, 520, decode_freq(
-                                  self._memobj.freq_ranges.vhf_tx_stop)))
-        freq_ranges.append(rs)
-        rs = RadioSetting("uhf_tx_start", "uhf tx start",
-                          RadioSettingValueInteger(
-                              66, 520, decode_freq(
-                                  self._memobj.freq_ranges.uhf_tx_start)))
-        freq_ranges.append(rs)
-        rs = RadioSetting("uhf_tx_stop", "uhf tx stop",
-                          RadioSettingValueInteger(
-                              66, 520, decode_freq(
-                                  self._memobj.freq_ranges.uhf_tx_stop)))
-        freq_ranges.append(rs)
-
-        # tell the decoded ranges to UI
-        self.valid_freq = \
-            [(decode_freq(self._memobj.freq_ranges.vhf_rx_start) * 1000000,
-             (decode_freq(self._memobj.freq_ranges.vhf_rx_stop)+1) * 1000000)]
-
-        return group
-
-    @classmethod
-    def match_model(cls, filedata, filename):
-        if len(filedata) == 8192 and \
-                filedata[0x60:0x64] != "2009" and \
-                filedata[0x170:0x173] != "LX-" and \
-                filedata[0xF7E:0xF80] != "\x01\xE2" and \
-                filedata[0x1f77:0x1f7d] == "\xff\xff\xff\xff\xff\xff" and \
-                filedata[0x0d70:0x0d80] != "\xff\xff\xff\xff\xff\xff\xff\xff" \
-                                           "\xff\xff\xff\xff\xff\xff\xff\xff":
-            return True
-        return False
+    return mf.get_memory()
 
 
-@directory.register
-class KG818Radio(KG816Radio):
-    """Wouxun KG-818"""
-    MODEL = "KG-818"
+def set_memory(pipe, vfo, memory):
+    """Set memory @memory on @vfo via @pipe"""
+    frame = IC92MemoryFrame()
+    frame.set_memory(memory)
+    frame.set_vfo(vfo)
 
-    @classmethod
-    def match_model(cls, filedata, filename):
-        return False
+    # LOG.debug("Sending (%i):" % (len(frame.get_raw())))
+    # LOG.debug(util.hexprint(frame.get_raw()))
+
+    rframe = frame.send(pipe)
+
+    if rframe.get_raw()[2] != "\xfb":
+        raise errors.InvalidDataError("Radio reported error:\n%s" %
+                                      util.hexprint(rframe.get_payload()))
+
+
+def erase_memory(pipe, vfo, number):
+    """Erase memory @number on @vfo via @pipe"""
+    frame = IC92MemClearFrame(number)
+    frame.set_vfo(vfo)
+
+    rframe = frame.send(pipe)
+    if rframe.get_raw()[2] != "\xfb":
+        raise errors.InvalidDataError("Radio reported error")
+
+
+def get_banks(pipe, vfo):
+    """Get banks for @vfo via @pipe"""
+    frame = IC92GetBankFrame()
+    frame.set_vfo(vfo)
+
+    rframes = frame.send(pipe)
+
+    if vfo == 1:
+        base = 180
+    else:
+        base = 237
+
+    banks = []
+
+    for i in range(base, base+26):
+        bframe = IC92BankFrame()
+        bframe.from_frame(rframes[i])
+
+        banks.append(bframe.get_name().rstrip())
+
+    return banks
+
+
+def set_banks(pipe, vfo, banks):
+    """Set banks for @vfo via @pipe"""
+    for i in range(0, 26):
+        bframe = IC92BankFrame()
+        bframe.set_vfo(vfo)
+        bframe.set_identifier(chr(i + ord("A")))
+        bframe.set_name(banks[i])
+
+        rframe = bframe.send(pipe)
+        if rframe.get_payload() != "\xfb":
+            raise errors.InvalidDataError("Radio reported error")
+
+
+def get_call(pipe, cstype, number):
+    """Get @cstype callsign @number via @pipe"""
+    cframe = IC92GetCallsignFrame(cstype.command, number)
+    cframe.set_vfo(2)
+    rframe = cframe.send(pipe)
+
+    cframe = IC92CallsignFrame()
+    cframe.from_frame(rframe)
+
+    return cframe.get_callsign()
+
+
+def set_call(pipe, cstype, number, call):
+    """Set @cstype @call at position @number via @pipe"""
+    cframe = cstype(number, call)
+    cframe.set_vfo(2)
+    rframe = cframe.send(pipe)
+
+    if rframe.get_payload() != "\xfb":
+        raise errors.RadioError("Radio reported error")
